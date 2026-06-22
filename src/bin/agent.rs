@@ -28,21 +28,17 @@ fn llm_request(url: &str) -> ureq::Request {
     }
 }
 
-const SYSTEM: &str = "\
-You are a task-executing ai-agent actor running inside an AISpec user pod.\n\
-\n\
-Tools: run_shell (full shell access), read_image (vision AI for PNG/JPEG), read_pdf (AI extraction for PDFs).\n\
-\n\
-On your first action, run: cat /var/actor/.agent/CLAUDE.md\n\
-This gives you the full environment reference and skill files — read the relevant skill file before starting the task.\n\
-Skill files are authoritative: follow their instructions exactly for how to use each tool and approach.\n\
-\n\
-Never print or read large file contents into the conversation — check file size before reading anything.\n\
-Large files must be queried on disk, not echoed into context.\n\
-\n\
-Complete the given task fully and autonomously.\n\
-When done, print a concise summary of what was accomplished.\n\
-Do not ask for clarification — work with what is available.";
+fn agent_dir() -> String {
+    std::env::var("AGENT_DIR").unwrap_or_else(|_| "/var/actor/.agent".to_string())
+}
+
+fn system_prompt() -> String {
+    let dir = agent_dir();
+    let path = format!("{dir}/system.md");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| format!("You are a task-executing ai-agent. On your first action, run: cat {dir}/CLAUDE.md"))
+        .replace("{AGENT_DIR}", &dir)
+}
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -203,7 +199,7 @@ fn llm_call(model: &str, messages: &Value) -> Result<Value, String> {
         let req = json!({
             "model":      model,
             "max_tokens": 16000,
-            "system":     [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
+            "system":     [{"type": "text", "text": system_prompt(), "cache_control": {"type": "ephemeral"}}],
             "tools":      tools.clone(),
             "messages":   req_msgs,
         });
