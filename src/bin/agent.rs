@@ -13,10 +13,19 @@ use std::io::Read;
 
 const DEFAULT_MODEL: &str = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
 const DEFAULT_MAX_ITER: usize = 50;
-const DEFAULT_LLM_URL: &str = "http://llm.aispec-system.svc.cluster.local/v1/messages";
+const DEFAULT_LLM_URL: &str = "http://llm.aispec-system.svc.cluster.local/anthropic/v1/messages";
 
 fn llm_url() -> String {
     std::env::var("LLM_URL").unwrap_or_else(|_| DEFAULT_LLM_URL.to_string())
+}
+
+fn llm_request(url: &str) -> ureq::Request {
+    let req = ureq::post(url).set("Content-Type", "application/json");
+    if let Ok(key) = std::env::var("LLM_API_KEY") {
+        req.set("Authorization", &format!("Bearer {key}"))
+    } else {
+        req
+    }
 }
 
 const SYSTEM: &str = "\
@@ -115,7 +124,7 @@ fn llm_single_call(model: &str, content_block: Value, question: &str) -> String 
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        match ureq::post(&llm_url()).set("Content-Type", "application/json").send_json(&req) {
+        match llm_request(&llm_url()).send_json(&req) {
             Ok(resp) => match resp.into_json::<Value>() {
                 Ok(v)  => return v["content"][0]["text"].as_str().unwrap_or("No response").to_string(),
                 Err(e) => return format!("Parse error: {e}"),
@@ -198,7 +207,7 @@ fn llm_call(model: &str, messages: &Value) -> Result<Value, String> {
             "tools":      tools.clone(),
             "messages":   req_msgs,
         });
-        match ureq::post(&llm_url()).set("Content-Type", "application/json").send_json(&req) {
+        match llm_request(&llm_url()).send_json(&req) {
             Ok(resp) => return resp.into_json::<Value>().map_err(|e| format!("Parse error: {e}")),
             Err(ureq::Error::Status(400, resp)) => {
                 let body = resp.into_string().unwrap_or_default();
