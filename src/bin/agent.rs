@@ -19,6 +19,10 @@ fn llm_url() -> String {
     std::env::var("LLM_URL").unwrap_or_else(|_| DEFAULT_LLM_URL.to_string())
 }
 
+fn llm_model() -> String {
+    std::env::var("LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
+}
+
 fn llm_request(url: &str) -> ureq::Request {
     let req = ureq::post(url).set("Content-Type", "application/json");
     if let Ok(key) = std::env::var("LLM_API_KEY") {
@@ -401,13 +405,13 @@ fn main() {
     // Stdin mode: agent [--thread <id>] < task.txt
     let (task, model, max_iter) = if filtered.len() > 1 {
         let task     = filtered[1].clone();
-        let model    = filtered.get(2).map(|s| s.to_string()).unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let model    = filtered.get(2).map(|s| s.to_string()).unwrap_or_else(|| llm_model());
         let max_iter = filtered.get(3).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_MAX_ITER);
         (task, model, max_iter)
     } else {
         let mut buf = String::new();
         std::io::stdin().read_to_string(&mut buf).ok();
-        (buf.trim().to_string(), DEFAULT_MODEL.to_string(), DEFAULT_MAX_ITER)
+        (buf.trim().to_string(), llm_model(), DEFAULT_MAX_ITER)
     };
 
     if task.is_empty() {
