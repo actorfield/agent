@@ -186,7 +186,7 @@ fn read_pdf(model: &str, path: &str, question: &str) -> String {
 
 // ── LLM ReAct call ────────────────────────────────────────────────────────────
 
-fn llm_call(model: &str, messages: &Value, _skill_ctx: &str) -> Result<Value, String> {
+fn llm_call(model: &str, messages: &Value, full_system: &str) -> Result<Value, String> {
     let mut msgs = messages.clone();
     let mut last_err = String::new();
 
@@ -227,7 +227,7 @@ fn llm_call(model: &str, messages: &Value, _skill_ctx: &str) -> Result<Value, St
         let req = json!({
             "model":      model,
             "max_tokens": 16000,
-            "system":     [{"type": "text", "text": format!("{}{}", system_prompt(), _skill_ctx), "cache_control": {"type": "ephemeral"}}],
+            "system":     [{"type": "text", "text": full_system, "cache_control": {"type": "ephemeral"}}],
             "tools":      tools.clone(),
             "messages":   req_msgs,
         });
@@ -308,7 +308,9 @@ fn append_thread(thread_id: &str, messages: &[Value]) {
 // ── ReAct loop ────────────────────────────────────────────────────────────────
 
 fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -> Result<String, String> {
+    // Build system prompt once — identical string every iteration = stable cache key
     let skill_ctx = inject_skill(task);
+    let full_system = format!("{}{}", system_prompt(), skill_ctx);
     // Load prior thread history if thread_id given, then append the new task
     let mut messages = if let Some(tid) = thread_id {
         let mut history = load_thread(tid);
@@ -323,7 +325,7 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
 
     for iter in 0..max_iter {
         eprintln!("[agent] iter {}", iter + 1);
-        let resp = match llm_call(model, &messages, &skill_ctx) {
+        let resp = match llm_call(model, &messages, &full_system) {
             Ok(v)  => v,
             Err(e) => return Err(format!("llm error on iteration {}: {}", iter + 1, e)),
         };
