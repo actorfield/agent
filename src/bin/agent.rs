@@ -388,11 +388,19 @@ fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -
                 _ => format!("unknown tool: {name}"),
             };
 
-            // Truncate large outputs to prevent context explosion and token limit crashes.
-            const MAX_RESULT_CHARS: usize = 24_000;
-            let result = if raw.len() > MAX_RESULT_CHARS {
-                let cut = raw[..MAX_RESULT_CHARS].rfind('\n').unwrap_or(MAX_RESULT_CHARS);
-                format!("{}\n[... output truncated: {} chars omitted. The full output was saved to disk — query it there rather than printing it ...]", &raw[..cut], raw.len() - cut)
+            // If output exceeds threshold, write full content to disk and send agent a pointer.
+            const MAX_INLINE_CHARS: usize = 16_000;
+            let result = if raw.len() > MAX_INLINE_CHARS {
+                let out_path = format!("/tmp/tool_result_{}.txt", id);
+                match std::fs::write(&out_path, &raw) {
+                    Ok(_) => format!(
+                        "Output too large ({} chars) — full content saved to {out_path}\n\
+                         Query it with grep/head/sed/awk rather than reading the whole file.\n\
+                         Example: grep -n 'keyword' {out_path} | head -30",
+                        raw.len()
+                    ),
+                    Err(e) => format!("Output too large ({} chars) and could not save to disk: {e}", raw.len()),
+                }
             } else {
                 raw
             };
