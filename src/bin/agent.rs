@@ -200,10 +200,10 @@ fn llm_call(model: &str, messages: &Value, full_system: &str) -> Result<Value, S
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        // Stamp cache_control on a fresh snapshot so trimming doesn't corrupt later attempts
+        // Stamp cache_control on the last human turn that isn't already stamped.
+        // Skip: tool_result messages, and the task message (already has cache_control from construction).
         let mut req_msgs = msgs.clone();
         if let Some(arr) = req_msgs.as_array_mut() {
-            // Skip tool_result messages (role:user with tool_result content) — same fix as orchestrator
             if let Some(last_human) = arr.iter_mut().rev().find(|m| {
                 m["role"] == "user"
                     && m["content"].as_array()
@@ -211,6 +211,10 @@ fn llm_call(model: &str, messages: &Value, full_system: &str) -> Result<Value, S
                         .and_then(|b| b.get("type"))
                         .and_then(|t| t.as_str())
                         != Some("tool_result")
+                    && m["content"].as_array()
+                        .and_then(|a| a.last())
+                        .and_then(|b| b.get("cache_control"))
+                        .is_none()
             }) {
                 if let Some(content) = last_human["content"].as_array_mut() {
                     if let Some(last_block) = content.last_mut() {
