@@ -1,0 +1,15 @@
+# Build artifacts
+target/
+
+# Agent specs (private IP)
+.agent/
+
+# Fossil artifacts
+.fslckout
+.fossil-settings/
+*.fossil
+
+# IDE
+.idea/
+.vscode/
+*.swp
