@@ -1,8 +1,8 @@
 # Agent
 
-A lightweight ReAct (Reasoning + Acting) agent loop for the Anthropic Messages
-API. Runs anywhere — as a standalone CLI, a Unix pipe, or a handler forked by
-the [Actor Mesh](https://github.com/muralidhar-challa/actor-mesh) runtime.
+A lightweight ReAct (Reasoning + Acting) agent loop supporting Anthropic and
+OpenAI-compatible APIs. Runs anywhere — as a standalone CLI, a Unix pipe, or a
+handler forked by the [Actor Mesh]
 
 ## Quick Start
 
@@ -55,11 +55,20 @@ needed.
     └── 02-rules.md    ← behavioural rules
 ```
 
+## Provider Detection
+
+The provider is inferred automatically from `LLM_URL`:
+
+| URL contains | Provider |
+|---|---|
+| `anthropic` | Anthropic Messages API |
+| anything else | OpenAI-compatible (`/v1/chat/completions`) |
+
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_URL` | `https://api.anthropic.com/v1/messages` | Anthropic API endpoint |
+| `LLM_URL` | `http://llm.aispec-system.svc.cluster.local/anthropic/v1/messages` | LLM endpoint (in-cluster proxy) |
 | `LLM_MODEL` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID |
 | `LLM_API_KEY` | — | API key (omit if auth is handled by proxy) |
 | `AGENT_DIR` | `/var/actor/.agent` | Path to system prompt + skills directory |
@@ -77,7 +86,7 @@ Threads are stored as JSONL in `/tmp/agent_thread_<id>.jsonl`.
 
 ## Usage as Actor-Mesh Handler
 
-The binary doubles as a handler for the [actor-mesh](https://github.com/muralidhar-challa/actor-mesh)
+The binary doubles as a handler for the [actor-mesh]
 runtime — just set `ACTOR_HANDLER`:
 
 ```sh
