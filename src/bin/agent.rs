@@ -1,4 +1,4 @@
-// AISpec ai-agent actor handler — ReAct loop against Anthropic Messages API
+// AISpec ai-agent actor handler — ReAct loop against Anthropic or OpenAI-compatible APIs
 //
 // Usage (forked by actor-mesh C runtime per ai_task tuple):
 //   payload bytes written to stdin by runtime
@@ -6,6 +6,10 @@
 // Standalone usage:
 //   agent 'task string' [model] [max_iter]
 //   agent < /tmp/task.txt
+//
+// Provider is inferred from LLM_URL:
+//   contains /v1/chat/completions  → OpenAI-compatible
+//   anything else                  → Anthropic (default)
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -13,7 +17,7 @@ use std::io::Read;
 
 const DEFAULT_MODEL: &str = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
 const DEFAULT_MAX_ITER: usize = 50;
-const DEFAULT_LLM_URL: &str = "https://api.anthropic.com/v1/messages";
+const DEFAULT_LLM_URL: &str = "http://llm.aispec-system.svc.cluster.local/anthropic/v1/messages";
 
 fn llm_url() -> String {
     std::env::var("LLM_URL").unwrap_or_else(|_| DEFAULT_LLM_URL.to_string())
@@ -40,11 +44,7 @@ fn system_prompt() -> String {
     let dir = agent_dir();
     let path = format!("{dir}/system.md");
     std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| {
-            format!(
-                "You are a task-executing ai-agent. On your first action, run: cat {dir}/CLAUDE.md"
-            )
-        })
+        .unwrap_or_else(|_| format!("You are a task-executing ai-agent. On your first action, run: cat {dir}/CLAUDE.md"))
         .replace("{AGENT_DIR}", &dir)
 }
 
@@ -53,28 +53,249 @@ fn inject_skill(_task: &str) -> String {
     let skills_dir = format!("{dir}/skills");
     let mut out = String::new();
     if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-        let mut paths: Vec<_> = entries
-            .flatten()
+        let mut paths: Vec<_> = entries.flatten()
             .map(|e| e.path())
             .filter(|p| p.extension().map(|e| e == "md").unwrap_or(false))
             .collect();
         paths.sort();
         for path in paths {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                out.push_str(&format!(
-                    "\n\n---\n## SKILL — {}\n\n{}",
-                    path.display(),
-                    content
-                ));
+                out.push_str(&format!("\n\n---\n## SKILL — {}\n\n{}", path.display(), content));
             }
         }
     }
     out
 }
 
-// ── Tool definitions ──────────────────────────────────────────────────────────
+// ── Provider abstraction ──────────────────────────────────────────────────────
 
-fn tool_defs() -> Value {
+struct ParsedResponse {
+    text_parts: Vec<String>,
+    tool_calls: Vec<ToolCall>,
+    /// Raw assistant message to push into history (provider-shaped)
+    assistant_msg: Value,
+}
+
+struct ToolCall {
+    id:    String,
+    name:  String,
+    input: Value,
+}
+
+struct ToolResult {
+    tool_use_id: String,
+    content:     String,
+}
+
+trait Provider {
+    fn tool_defs(&self) -> Value;
+    fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value) -> Value;
+    fn parse_response(&self, resp: Value) -> Result<ParsedResponse, String>;
+    /// Returns one or more messages to append to history for the given tool results.
+    fn wrap_tool_results(&self, results: Vec<ToolResult>) -> Vec<Value>;
+    /// Provider-specific context-trim: shrink the largest tool result in history.
+    fn trim_last_tool_result(&self, messages: &mut Value);
+}
+
+// ── Anthropic provider ────────────────────────────────────────────────────────
+
+struct Anthropic;
+
+impl Provider for Anthropic {
+    fn tool_defs(&self) -> Value {
+        let mut tools = base_tool_defs();
+        // cache_control on the last tool — stable cache breakpoint
+        if let Some(arr) = tools.as_array_mut() {
+            if let Some(last) = arr.last_mut() {
+                last["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
+        tools
+    }
+
+    fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value) -> Value {
+        // Stamp cache_control on the last human turn that isn't a tool_result and isn't already stamped.
+        let mut req_msgs = messages.clone();
+        if let Some(arr) = req_msgs.as_array_mut() {
+            if let Some(last_human) = arr.iter_mut().rev().find(|m| {
+                m["role"] == "user"
+                    && m["content"].as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|b| b.get("type"))
+                        .and_then(|t| t.as_str())
+                        != Some("tool_result")
+                    && m["content"].as_array()
+                        .and_then(|a| a.last())
+                        .and_then(|b| b.get("cache_control"))
+                        .is_none()
+            }) {
+                if let Some(content) = last_human["content"].as_array_mut() {
+                    if let Some(last_block) = content.last_mut() {
+                        last_block["cache_control"] = json!({"type": "ephemeral"});
+                    }
+                }
+            }
+        }
+        json!({
+            "model":      model,
+            "max_tokens": 16000,
+            "system":     [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+            "tools":      tools,
+            "messages":   req_msgs,
+        })
+    }
+
+    fn parse_response(&self, resp: Value) -> Result<ParsedResponse, String> {
+        let content = resp["content"].as_array()
+            .ok_or("no content in response")?
+            .clone();
+
+        let mut text_parts = vec![];
+        let mut tool_calls = vec![];
+        for block in &content {
+            match block["type"].as_str() {
+                Some("text") => {
+                    if let Some(t) = block["text"].as_str() { text_parts.push(t.to_string()); }
+                }
+                Some("tool_use") => {
+                    tool_calls.push(ToolCall {
+                        id:    block["id"].as_str().unwrap_or("").to_string(),
+                        name:  block["name"].as_str().unwrap_or("").to_string(),
+                        input: block["input"].clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(ParsedResponse {
+            text_parts,
+            tool_calls,
+            assistant_msg: json!({ "role": "assistant", "content": content }),
+        })
+    }
+
+    fn wrap_tool_results(&self, results: Vec<ToolResult>) -> Vec<Value> {
+        let blocks: Vec<Value> = results.into_iter().map(|r| json!({
+            "type":        "tool_result",
+            "tool_use_id": r.tool_use_id,
+            "content":     r.content,
+        })).collect();
+        vec![json!({ "role": "user", "content": blocks })]
+    }
+
+    fn trim_last_tool_result(&self, messages: &mut Value) {
+        if let Some(arr) = messages.as_array_mut() {
+            if let Some(last) = arr.iter_mut().rev().find(|m| m["role"] == "user") {
+                if let Some(content) = last["content"].as_array_mut() {
+                    let largest = content.iter_mut()
+                        .filter(|b| b["type"] == "tool_result")
+                        .max_by_key(|b| b["content"].as_str().map(|s| s.len()).unwrap_or(0));
+                    if let Some(block) = largest {
+                        block["content"] = json!("[output removed — too large for context. The data was saved to disk; query it there.]");
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── OpenAI provider ───────────────────────────────────────────────────────────
+
+struct OpenAI;
+
+impl Provider for OpenAI {
+    fn tool_defs(&self) -> Value {
+        let base = base_tool_defs();
+        let arr = base.as_array().unwrap();
+        let tools: Vec<Value> = arr.iter().map(|t| json!({
+            "type": "function",
+            "function": {
+                "name":        t["name"],
+                "description": t["description"],
+                "parameters":  t["input_schema"],
+            }
+        })).collect();
+        json!(tools)
+    }
+
+    fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value) -> Value {
+        // Prepend system as first message
+        let mut all_msgs = vec![json!({"role": "system", "content": system})];
+        if let Some(arr) = messages.as_array() {
+            all_msgs.extend(arr.iter().cloned());
+        }
+        json!({
+            "model":      model,
+            "max_tokens": 16000,
+            "tools":      tools,
+            "messages":   all_msgs,
+        })
+    }
+
+    fn parse_response(&self, resp: Value) -> Result<ParsedResponse, String> {
+        let msg = resp["choices"][0]["message"].clone();
+        if msg.is_null() {
+            return Err("no choices[0].message in response".into());
+        }
+
+        let mut text_parts = vec![];
+        if let Some(t) = msg["content"].as_str() {
+            if !t.is_empty() { text_parts.push(t.to_string()); }
+        }
+
+        let mut tool_calls = vec![];
+        if let Some(tcs) = msg["tool_calls"].as_array() {
+            for tc in tcs {
+                let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                tool_calls.push(ToolCall {
+                    id:    tc["id"].as_str().unwrap_or("").to_string(),
+                    name:  tc["function"]["name"].as_str().unwrap_or("").to_string(),
+                    input,
+                });
+            }
+        }
+
+        // Reconstruct assistant message in OpenAI history format
+        let assistant_msg = json!({ "role": "assistant", "content": msg["content"], "tool_calls": msg["tool_calls"] });
+
+        Ok(ParsedResponse { text_parts, tool_calls, assistant_msg })
+    }
+
+    fn wrap_tool_results(&self, results: Vec<ToolResult>) -> Vec<Value> {
+        // Each tool result is its own message in OpenAI format
+        results.into_iter().map(|r| json!({
+            "role":         "tool",
+            "tool_call_id": r.tool_use_id,
+            "content":      r.content,
+        })).collect()
+    }
+
+    fn trim_last_tool_result(&self, messages: &mut Value) {
+        if let Some(arr) = messages.as_array_mut() {
+            // Find the largest role:tool message and shrink its content
+            let largest = arr.iter_mut()
+                .filter(|m| m["role"] == "tool")
+                .max_by_key(|m| m["content"].as_str().map(|s| s.len()).unwrap_or(0));
+            if let Some(msg) = largest {
+                msg["content"] = json!("[output removed — too large for context. The data was saved to disk; query it there.]");
+            }
+        }
+    }
+}
+
+fn detect_provider(url: &str) -> Box<dyn Provider> {
+    if url.contains("anthropic") {
+        Box::new(Anthropic)
+    } else {
+        Box::new(OpenAI)
+    }
+}
+
+// ── Shared tool definitions (provider-neutral) ────────────────────────────────
+
+fn base_tool_defs() -> Value {
     json!([
         {
             "name": "run_shell",
@@ -88,7 +309,7 @@ fn tool_defs() -> Value {
         {
             "name": "read_image",
             "description": "Read a JPEG or PNG image and extract information using vision AI. \
-    Processes the entire image in a single API call — ask for everything needed in one question.",
+Processes the entire image in a single API call — ask for everything needed in one question.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -101,7 +322,7 @@ fn tool_defs() -> Value {
         {
             "name": "read_pdf",
             "description": "Read a PDF file and extract information using AI. \
-    Submits the entire PDF in a single API call (limit: 100 pages / 32 MB) — ask for everything needed in one comprehensive question.",
+Submits the entire PDF in a single API call (limit: 100 pages / 32 MB) — ask for everything needed in one comprehensive question.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -117,56 +338,45 @@ fn tool_defs() -> Value {
 // ── Tool implementations ──────────────────────────────────────────────────────
 
 fn run_shell(command: &str) -> String {
-    match std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .output()
-    {
+    match std::process::Command::new("sh").arg("-c").arg(command).output() {
         Ok(out) => {
             let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
             s.push_str(&String::from_utf8_lossy(&out.stderr));
-            if s.trim().is_empty() {
-                "(no output)".into()
-            } else {
-                s
-            }
+            if s.trim().is_empty() { "(no output)".into() } else { s }
         }
         Err(e) => format!("Error: {e}"),
     }
 }
 
 fn file_to_b64(path: &str) -> Result<(String, String), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("Error: could not read {path}: {e}"))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("Error: could not read {path}: {e}"))?;
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
     let mime = match ext.as_str() {
         "png" => "image/png",
         "gif" => "image/gif",
         "pdf" => "application/pdf",
-        _ => "image/jpeg",
+        _     => "image/jpeg",
     };
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok((mime.to_string(), b64))
 }
 
-fn llm_single_call(model: &str, content_block: Value, question: &str) -> String {
+fn llm_single_call(content_block: Value, question: &str) -> String {
     let req = json!({
-        "model": model,
+        "model": llm_model(),
         "max_tokens": 4096,
         "messages": [{ "role": "user", "content": [content_block, {"type":"text","text":question}] }]
     });
+    let url = llm_url();
     let mut last_err = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        match llm_request(&llm_url()).send_json(&req) {
+        match llm_request(&url).send_json(&req) {
             Ok(resp) => match resp.into_json::<Value>() {
-                Ok(v) => {
-                    return v["content"][0]["text"]
-                        .as_str()
-                        .unwrap_or("No response")
-                        .to_string()
-                }
+                Ok(v)  => return v["content"][0]["text"].as_str().unwrap_or("No response").to_string(),
                 Err(e) => return format!("Parse error: {e}"),
             },
             Err(ureq::Error::Status(502, resp)) => {
@@ -186,111 +396,39 @@ fn llm_single_call(model: &str, content_block: Value, question: &str) -> String 
     last_err
 }
 
-fn read_image(model: &str, path: &str, question: &str) -> String {
-    let (mime, b64) = match file_to_b64(path) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+fn read_image(path: &str, question: &str) -> String {
+    let (mime, b64) = match file_to_b64(path) { Ok(v) => v, Err(e) => return e };
     llm_single_call(
-        model,
         json!({"type":"image","source":{"type":"base64","media_type":mime,"data":b64}}),
-        question,
-    )
+        question)
 }
 
-fn read_pdf(model: &str, path: &str, question: &str) -> String {
-    let (_, b64) = match file_to_b64(path) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+fn read_pdf(path: &str, question: &str) -> String {
+    let (_, b64) = match file_to_b64(path) { Ok(v) => v, Err(e) => return e };
     llm_single_call(
-        model,
         json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}}),
-        question,
-    )
+        question)
 }
 
 // ── LLM ReAct call ────────────────────────────────────────────────────────────
 
-fn llm_call(model: &str, messages: &Value, full_system: &str) -> Result<Value, String> {
-    let mut msgs = messages.clone();
+fn llm_call(provider: &dyn Provider, model: &str, messages: &mut Value, full_system: &str) -> Result<Value, String> {
+    let tools = provider.tool_defs();
+    let url = llm_url();
     let mut last_err = String::new();
-
-    // Tools are constant across attempts — build once with cache_control
-    let tools = {
-        let mut t = tool_defs();
-        if let Some(arr) = t.as_array_mut() {
-            if let Some(last) = arr.last_mut() {
-                last["cache_control"] = json!({"type": "ephemeral"});
-            }
-        }
-        t
-    };
 
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        // Stamp cache_control on the last human turn that isn't already stamped.
-        // Skip: tool_result messages, and the task message (already has cache_control from construction).
-        let mut req_msgs = msgs.clone();
-        if let Some(arr) = req_msgs.as_array_mut() {
-            if let Some(last_human) = arr.iter_mut().rev().find(|m| {
-                m["role"] == "user"
-                    && m["content"]
-                        .as_array()
-                        .and_then(|a| a.first())
-                        .and_then(|b| b.get("type"))
-                        .and_then(|t| t.as_str())
-                        != Some("tool_result")
-                    && m["content"]
-                        .as_array()
-                        .and_then(|a| a.last())
-                        .and_then(|b| b.get("cache_control"))
-                        .is_none()
-            }) {
-                if let Some(content) = last_human["content"].as_array_mut() {
-                    if let Some(last_block) = content.last_mut() {
-                        last_block["cache_control"] = json!({"type": "ephemeral"});
-                    }
-                }
-            }
-        }
-        let req = json!({
-            "model":      model,
-            "max_tokens": 16000,
-            "system":     [{"type": "text", "text": full_system, "cache_control": {"type": "ephemeral"}}],
-            "tools":      tools.clone(),
-            "messages":   req_msgs,
-        });
-        match llm_request(&llm_url()).send_json(&req) {
-            Ok(resp) => {
-                return resp
-                    .into_json::<Value>()
-                    .map_err(|e| format!("Parse error: {e}"))
-            }
+        let req = provider.build_request(model, full_system, &tools, messages);
+        match llm_request(&url).send_json(&req) {
+            Ok(resp) => return resp.into_json::<Value>().map_err(|e| format!("Parse error: {e}")),
             Err(ureq::Error::Status(400, resp)) => {
                 let body = resp.into_string().unwrap_or_default();
                 if body.contains("prompt is too long") {
-                    // Context too large — find the largest tool_result in the last user message
-                    // and replace its content with a notice, then retry.
                     eprintln!("[agent] context too large — trimming last tool result and retrying");
-                    if let Some(arr) = msgs.as_array_mut() {
-                        if let Some(last) = arr.iter_mut().rev().find(|m| m["role"] == "user") {
-                            if let Some(content) = last["content"].as_array_mut() {
-                                // Find the largest tool_result block and shrink it
-                                let largest = content
-                                    .iter_mut()
-                                    .filter(|b| b["type"] == "tool_result")
-                                    .max_by_key(|b| {
-                                        b["content"].as_str().map(|s| s.len()).unwrap_or(0)
-                                    });
-                                if let Some(block) = largest {
-                                    block["content"] = json!("[output removed — too large for context. The data was saved to disk; query it there.]");
-                                }
-                            }
-                        }
-                    }
+                    provider.trim_last_tool_result(messages);
                     last_err = "context trimmed after prompt-too-long".into();
                     continue;
                 }
@@ -325,11 +463,8 @@ fn thread_path(thread_id: &str) -> String {
 
 fn load_thread(thread_id: &str) -> Vec<Value> {
     let path = thread_path(thread_id);
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return vec![];
-    };
-    contents
-        .lines()
+    let Ok(contents) = std::fs::read_to_string(&path) else { return vec![] };
+    contents.lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect()
 }
@@ -337,16 +472,9 @@ fn load_thread(thread_id: &str) -> Vec<Value> {
 fn append_thread(thread_id: &str, new_messages: &[Value]) {
     use std::io::Write;
     let path = thread_path(thread_id);
-    let mut file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
-        Err(e) => {
-            eprintln!("[agent] thread write error: {e}");
-            return;
-        }
+        Err(e) => { eprintln!("[agent] thread write error: {e}"); return; }
     };
     for msg in new_messages {
         if let Ok(line) = serde_json::to_string(msg) {
@@ -357,129 +485,79 @@ fn append_thread(thread_id: &str, new_messages: &[Value]) {
 
 // ── ReAct loop ────────────────────────────────────────────────────────────────
 
-fn run_task(
-    model: &str,
-    task: &str,
-    max_iter: usize,
-    thread_id: Option<&str>,
-) -> Result<String, String> {
-    // Build system prompt once — identical string every iteration = stable cache key
+fn run_task(model: &str, task: &str, max_iter: usize, thread_id: Option<&str>) -> Result<String, String> {
+    let url = llm_url();
+    let provider = detect_provider(&url);
+
     let skill_ctx = inject_skill(task);
     let full_system = format!("{}{}", system_prompt(), skill_ctx);
-    // 4th cache breakpoint — task + run start timestamp, stable for entire run
+
     let run_ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let task_with_ts = format!("[run started: {run_ts}]\n{task}");
     let task_msg = json!({
         "role": "user",
         "content": [{"type": "text", "text": task_with_ts, "cache_control": {"type": "ephemeral"}}]
     });
-    // Load prior thread history if thread_id given, then append the new task
+
     let mut messages = if let Some(tid) = thread_id {
         let mut history = load_thread(tid);
         if !history.is_empty() {
-            eprintln!(
-                "[agent] resuming thread {} ({} prior messages)",
-                tid,
-                history.len()
-            );
+            eprintln!("[agent] resuming thread {} ({} prior messages)", tid, history.len());
         }
         history.push(task_msg);
         json!(history)
     } else {
         json!([task_msg])
     };
-    // Track how many messages are already on disk — only append new ones each round-trip
     let mut persisted_len = messages.as_array().map(|a| a.len()).unwrap_or(0) - 1;
 
     for iter in 0..max_iter {
         eprintln!("[agent] iter {}", iter + 1);
-        let resp = match llm_call(model, &messages, &full_system) {
-            Ok(v) => v,
+        let resp = match llm_call(provider.as_ref(), model, &mut messages, &full_system) {
+            Ok(v)  => v,
             Err(e) => return Err(format!("llm error on iteration {}: {}", iter + 1, e)),
         };
 
-        let content = match resp["content"].as_array() {
-            Some(c) => c.clone(),
-            None => return Err("no content in response".into()),
-        };
+        let parsed = provider.parse_response(resp)?;
 
-        let mut text_parts: Vec<String> = vec![];
-        let mut tool_calls: Vec<Value> = vec![];
-        for block in &content {
-            match block["type"].as_str() {
-                Some("text") => {
-                    if let Some(t) = block["text"].as_str() {
-                        text_parts.push(t.to_string());
-                    }
-                }
-                Some("tool_use") => {
-                    tool_calls.push(block.clone());
-                }
-                _ => {}
-            }
-        }
+        messages.as_array_mut().unwrap().push(parsed.assistant_msg);
 
-        messages
-            .as_array_mut()
-            .unwrap()
-            .push(json!({ "role": "assistant", "content": content }));
-
-        if tool_calls.is_empty() {
+        if parsed.tool_calls.is_empty() {
             eprintln!("[agent] done after {} iter(s)", iter + 1);
             if let Some(tid) = thread_id {
                 let all = messages.as_array().unwrap();
                 append_thread(tid, &all[persisted_len..]);
             }
-            return Ok(text_parts.join("\n"));
+            return Ok(parsed.text_parts.join("\n"));
         }
 
-        let mut tool_results: Vec<Value> = vec![];
-        for tc in &tool_calls {
-            let name = tc["name"].as_str().unwrap_or("");
-            let input = &tc["input"];
-            let id = tc["id"].as_str().unwrap_or("");
-
-            match name {
-                "run_shell" => eprintln!(
-                    "[agent] run_shell: {}",
-                    input["command"].as_str().unwrap_or("")
-                ),
-                "read_image" => eprintln!(
-                    "[agent] read_image: {}",
-                    input["path"].as_str().unwrap_or("")
-                ),
-                "read_pdf" => {
-                    eprintln!("[agent] read_pdf: {}", input["path"].as_str().unwrap_or(""))
-                }
-                _ => eprintln!("[agent] tool: {name}"),
+        let mut tool_results: Vec<ToolResult> = vec![];
+        for tc in &parsed.tool_calls {
+            match tc.name.as_str() {
+                "run_shell"  => eprintln!("[agent] run_shell: {}", tc.input["command"].as_str().unwrap_or("")),
+                "read_image" => eprintln!("[agent] read_image: {}", tc.input["path"].as_str().unwrap_or("")),
+                "read_pdf"   => eprintln!("[agent] read_pdf: {}", tc.input["path"].as_str().unwrap_or("")),
+                name         => eprintln!("[agent] tool: {name}"),
             }
 
-            let raw = match name {
-                "run_shell" => run_shell(input["command"].as_str().unwrap_or("")),
+            let raw = match tc.name.as_str() {
+                "run_shell"  => run_shell(tc.input["command"].as_str().unwrap_or("")),
                 "read_image" => read_image(
-                    model,
-                    input["path"].as_str().unwrap_or(""),
-                    input["question"]
-                        .as_str()
-                        .unwrap_or("Extract all text and data from this image verbatim."),
+                    tc.input["path"].as_str().unwrap_or(""),
+                    tc.input["question"].as_str().unwrap_or("Extract all text and data from this image verbatim."),
                 ),
-                "read_pdf" => read_pdf(
-                    model,
-                    input["path"].as_str().unwrap_or(""),
-                    input["question"]
-                        .as_str()
-                        .unwrap_or("Extract all text and data from this PDF verbatim."),
+                "read_pdf"   => read_pdf(
+                    tc.input["path"].as_str().unwrap_or(""),
+                    tc.input["question"].as_str().unwrap_or("Extract all text and data from this PDF verbatim."),
                 ),
-                _ => format!("unknown tool: {name}"),
+                name => format!("unknown tool: {name}"),
             };
 
-            // Stamp every tool result with current time for loop detection.
             let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-            // If output exceeds threshold, write full content to disk and send agent a pointer.
             const MAX_INLINE_CHARS: usize = 16_000;
-            let result = if raw.len() > MAX_INLINE_CHARS {
-                let out_path = format!("/tmp/tool_result_{}.txt", id);
+            let content = if raw.len() > MAX_INLINE_CHARS {
+                let out_path = format!("/tmp/tool_result_{}.txt", tc.id);
                 match std::fs::write(&out_path, &raw) {
                     Ok(_) => format!(
                         "[{ts}] Output too large ({} chars) — full content saved to {out_path}\n\
@@ -487,26 +565,18 @@ fn run_task(
                          Example: grep -n 'keyword' {out_path} | head -30",
                         raw.len()
                     ),
-                    Err(e) => format!(
-                        "[{ts}] Output too large ({} chars) and could not save to disk: {e}",
-                        raw.len()
-                    ),
+                    Err(e) => format!("[{ts}] Output too large ({} chars) and could not save to disk: {e}", raw.len()),
                 }
             } else {
                 format!("[{ts}]\n{raw}")
             };
 
-            tool_results.push(json!({
-                "type":        "tool_result",
-                "tool_use_id": id,
-                "content":     result,
-            }));
+            tool_results.push(ToolResult { tool_use_id: tc.id.clone(), content });
         }
 
-        messages
-            .as_array_mut()
-            .unwrap()
-            .push(json!({ "role": "user", "content": tool_results }));
+        for msg in provider.wrap_tool_results(tool_results) {
+            messages.as_array_mut().unwrap().push(msg);
+        }
 
         if let Some(tid) = thread_id {
             let all = messages.as_array().unwrap();
@@ -523,31 +593,21 @@ fn run_task(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse --thread <id> from anywhere in args, filter by position not value
     let thread_flag_pos = args.iter().position(|a| a == "--thread");
     let thread_id = thread_flag_pos.and_then(|i| args.get(i + 1)).cloned();
     let skip: std::collections::HashSet<usize> = thread_flag_pos
         .map(|i| [i, i + 1].into_iter().collect())
         .unwrap_or_default();
-    let filtered: Vec<&String> = args
-        .iter()
+    let filtered: Vec<&String> = args.iter()
         .enumerate()
         .filter(|(i, _)| !skip.contains(i))
         .map(|(_, a)| a)
         .collect();
 
-    // CLI mode:   agent [--thread <id>] 'task' [model] [max_iter]
-    // Stdin mode: agent [--thread <id>] < task.txt
     let (task, model, max_iter) = if filtered.len() > 1 {
-        let task = filtered[1].clone();
-        let model = filtered
-            .get(2)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| llm_model());
-        let max_iter = filtered
-            .get(3)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_MAX_ITER);
+        let task     = filtered[1].clone();
+        let model    = filtered.get(2).map(|s| s.to_string()).unwrap_or_else(|| llm_model());
+        let max_iter = filtered.get(3).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_MAX_ITER);
         (task, model, max_iter)
     } else {
         let mut buf = String::new();
@@ -562,14 +622,9 @@ fn main() {
 
     match run_task(&model, &task, max_iter, thread_id.as_deref()) {
         Ok(result) => {
-            // Emit result topic override then result — actor-mesh runtime uses first line
-            // as the publish topic if it matches `topic_name\n` pattern.
             println!("ai_result");
             println!("{result}");
         }
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
+        Err(e) => { eprintln!("{e}"); std::process::exit(1); }
     }
 }
