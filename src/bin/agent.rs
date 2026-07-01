@@ -114,26 +114,21 @@ impl Provider for Anthropic {
     }
 
     fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value) -> Value {
-        // Stamp cache_control on the last human turn that isn't a tool_result and isn't already stamped.
+        // Stamp cache_control on the last content block of the last message so the
+        // growing conversation tail (assistant turns + tool_results) is cached
+        // incrementally: each turn the previous tail becomes a cache hit and the
+        // breakpoint moves forward. The task message keeps its own permanent
+        // breakpoint as a stable anchor; together with the system and tools
+        // breakpoints that holds us at Anthropic's 4-breakpoint maximum. Stamping
+        // happens on this per-request clone only, so it never accumulates on the
+        // persisted `messages` array.
         let mut req_msgs = messages.clone();
-        if let Some(arr) = req_msgs.as_array_mut() {
-            if let Some(last_human) = arr.iter_mut().rev().find(|m| {
-                m["role"] == "user"
-                    && m["content"].as_array()
-                        .and_then(|a| a.first())
-                        .and_then(|b| b.get("type"))
-                        .and_then(|t| t.as_str())
-                        != Some("tool_result")
-                    && m["content"].as_array()
-                        .and_then(|a| a.last())
-                        .and_then(|b| b.get("cache_control"))
-                        .is_none()
-            }) {
-                if let Some(content) = last_human["content"].as_array_mut() {
-                    if let Some(last_block) = content.last_mut() {
-                        last_block["cache_control"] = json!({"type": "ephemeral"});
-                    }
-                }
+        if let Some(last_msg) = req_msgs.as_array_mut().and_then(|a| a.last_mut()) {
+            if let Some(last_block) = last_msg["content"]
+                .as_array_mut()
+                .and_then(|c| c.last_mut())
+            {
+                last_block["cache_control"] = json!({"type": "ephemeral"});
             }
         }
         json!({
