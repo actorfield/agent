@@ -447,6 +447,34 @@ mod tests {
     }
 
     #[test]
+    fn text_only_turn_persists_task_and_reply_with_thread() {
+        // No tool calls, but a thread id is set: the terminal branch must persist
+        // the task message and the assistant reply (persisted_len still at start).
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().to_path_buf());
+        let client = ScriptedClient::new(vec![text_turn("done, no tools")]);
+        let provider = Anthropic;
+        let c = ctx(&client, &provider, &paths, 100);
+        let r = run(
+            &c,
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                thread_id: Some("t".into()),
+            },
+        );
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.output.as_deref(), Some("done, no tools"));
+        assert_eq!(r.steps_taken, 0);
+
+        let saved = thread::load_thread(&paths, "t");
+        assert_eq!(saved.len(), 2, "task message + assistant reply persisted");
+        assert_eq!(saved[0]["role"], "user");
+        assert_eq!(saved[1]["role"], "assistant");
+    }
+
+    #[test]
     fn runs_a_tool_then_finishes() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path().to_path_buf());
