@@ -71,6 +71,8 @@ focused subtasks whose intermediate steps you do not need to keep in your own co
                             "description": "Requirements the result must satisfy." },
                 "persistence": { "type": "string", "enum": ["ephemeral", "durable"],
                                  "description": "Whether the sub-agent should persist progress to resume after a restart. Defaults to ephemeral." },
+                "effort": { "type": "string", "enum": ["none", "low", "medium", "high"],
+                            "description": "Extended-reasoning effort for the sub-agent's model calls. Defaults to inheriting the caller's own effort level; omit to inherit, set \"none\" to explicitly disable reasoning regardless of the caller's level, or set low/medium/high for subtasks that need deeper reasoning." },
                 "max_iter": { "type": "integer", "description": "Iteration budget for the sub-agent." }
             },
             "required": ["task"]

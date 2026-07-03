@@ -9,12 +9,12 @@
 //
 // Provider is inferred from LLM_URL (see agent::provider).
 
-use std::cell::Cell;
 use std::io::Read;
-use std::rc::Rc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use agent::agent_loop::{run, Ctx, RunConfig};
-use agent::job::{Job, Persistence};
+use agent::job::{Effort, Job, Persistence};
 use agent::llm::{llm_model, UreqClient};
 use agent::policy::root_policy;
 use agent::provider::detect_provider;
@@ -72,29 +72,39 @@ fn main() {
     let url = agent::llm::llm_url();
     let provider = detect_provider(&url);
     let client = UreqClient;
-    let paths = Paths::system();
+
+    // Job id is created up front so the run's own directory can be keyed by it —
+    // every run has a job id regardless of whether it's durable/threaded.
+    let job = Job::new(task, Vec::new(), Persistence::Ephemeral, max_iter);
+    let paths = Paths::for_root(&Paths::default_base(), &job.id);
 
     // Per-run tool-call budget: the top-level run and each sub-agent each get their
     // own fresh allowance of this size — no tree-wide pool.
     let tool_budget = env_usize("AGENT_TOOL_BUDGET", DEFAULT_TOOL_BUDGET);
+    // Opt-in extended-reasoning effort for the top-level run; unset (or any value
+    // other than low/medium/high) sends no reasoning param, matching prior
+    // behavior. Sub-agents inherit this unless a spawn_agent call overrides it.
+    let effort = Effort::parse(std::env::var("AGENT_EFFORT").ok().as_deref());
     let ctx = Ctx {
         client: &client,
         provider: provider.as_ref(),
-        paths: &paths,
+        paths,
         model: &model,
-        budget: Rc::new(Cell::new(tool_budget)),
+        effort,
+        budget: Arc::new(AtomicUsize::new(tool_budget)),
         sub_budget: tool_budget,
-        fanout: Rc::new(Cell::new(0)),
+        fanout: Arc::new(AtomicUsize::new(0)),
         max_fanout: env_usize("AGENT_MAX_FANOUT", DEFAULT_MAX_FANOUT),
+        spawn_index: Arc::new(AtomicUsize::new(0)),
     };
 
-    let job = Job::new(task, Vec::new(), Persistence::Ephemeral, max_iter);
     let result = run(
         &ctx,
         RunConfig {
             job,
             policy: root_policy(),
             depth: 0,
+            label: "d0".to_string(),
             thread_id,
         },
     );

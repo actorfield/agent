@@ -5,6 +5,7 @@
 
 use serde_json::{json, Value};
 
+use crate::job::Effort;
 use crate::provider::Provider;
 
 const DEFAULT_MODEL: &str = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
@@ -28,7 +29,9 @@ pub fn llm_request(url: &str) -> ureq::Request {
 }
 
 /// One call to the model: send `messages`, return the raw response.
-pub trait LlmClient {
+/// `Send + Sync` so a `Ctx` holding `&dyn LlmClient` can be shared across the
+/// scoped threads spawn_agent uses to run concurrent sub-agents.
+pub trait LlmClient: Send + Sync {
     fn call(
         &self,
         provider: &dyn Provider,
@@ -36,6 +39,7 @@ pub trait LlmClient {
         messages: &mut Value,
         system: &str,
         tools: &Value,
+        effort: Effort,
     ) -> Result<Value, String>;
 }
 
@@ -66,7 +70,10 @@ fn decide(attempt: &Attempt) -> Next {
                 Next::Fail(format!("HTTP 400: {}", clip(body)))
             }
         }
-        Attempt::Status(502, body) => Next::Retry(format!("HTTP 502: {}", clip(body))),
+        Attempt::Status(429, body) => Next::Retry(format!("HTTP 429: {}", clip(body))),
+        Attempt::Status(code, body) if (500..600).contains(code) => {
+            Next::Retry(format!("HTTP {code}: {}", clip(body)))
+        }
         Attempt::Status(code, body) => Next::Fail(format!("HTTP {code}: {}", clip(body))),
         Attempt::Network(msg) => {
             if msg.contains("NetworkError") || msg.contains("Connection") {
@@ -93,6 +100,7 @@ impl LlmClient for UreqClient {
         messages: &mut Value,
         system: &str,
         tools: &Value,
+        effort: Effort,
     ) -> Result<Value, String> {
         let url = llm_url();
         let mut last_err = String::new();
@@ -100,7 +108,7 @@ impl LlmClient for UreqClient {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            let req = provider.build_request(model, system, tools, messages);
+            let req = provider.build_request(model, system, tools, messages, effort);
             let outcome = match llm_request(&url).send_json(&req) {
                 Ok(resp) => match resp.into_json::<Value>() {
                     Ok(v) => Attempt::Ok(v),
@@ -188,14 +196,23 @@ mod tests {
     }
 
     #[test]
-    fn server_502_retries() {
-        let a = Attempt::Status(502, "bad gateway".into());
+    fn server_5xx_retries() {
+        for code in [500, 502, 503, 504, 599] {
+            let a = Attempt::Status(code, "server error".into());
+            assert!(matches!(decide(&a), Next::Retry(_)), "expected retry for {code}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_429_retries() {
+        let a = Attempt::Status(429, "rate limited".into());
         assert!(matches!(decide(&a), Next::Retry(_)));
     }
 
     #[test]
     fn other_status_fails() {
         assert!(matches!(decide(&Attempt::Status(403, "no".into())), Next::Fail(_)));
+        assert!(matches!(decide(&Attempt::Status(404, "no".into())), Next::Fail(_)));
     }
 
     #[test]

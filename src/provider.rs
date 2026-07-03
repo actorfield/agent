@@ -8,6 +8,8 @@
 
 use serde_json::{json, Value};
 
+use crate::job::Effort;
+
 /// A model turn parsed into a neutral shape.
 pub struct ParsedResponse {
     pub text_parts: Vec<String>,
@@ -27,10 +29,12 @@ pub struct ToolResult {
     pub content: String,
 }
 
-pub trait Provider {
+/// `Send + Sync` so a `Ctx` holding `&dyn Provider` can be shared across the
+/// scoped threads spawn_agent uses to run concurrent sub-agents.
+pub trait Provider: Send + Sync {
     /// Shape the neutral tool list into the provider's request format.
     fn shape_tools(&self, base: &Value) -> Value;
-    fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value) -> Value;
+    fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value, effort: Effort) -> Value;
     fn parse_response(&self, resp: Value) -> Result<ParsedResponse, String>;
     /// One or more messages to append to history for the given tool results.
     fn wrap_tool_results(&self, results: Vec<ToolResult>) -> Vec<Value>;
@@ -54,6 +58,46 @@ pub fn detect_provider(url: &str) -> Box<dyn Provider> {
 
 // ── Anthropic ──────────────────────────────────────────────────────────────────
 
+/// Model families confirmed to support adaptive thinking (`thinking.effort`).
+/// Anthropic 400s on `type: "adaptive"` for anything else — see
+/// https://github.com/anomalyco/opencode/issues/17876 — so this must stay an
+/// allowlist, not a denylist.
+const ADAPTIVE_THINKING_MODELS: &[&str] = &["opus-4-8", "sonnet-5", "haiku-4-6", "claude-5", "mythos"];
+
+fn is_adaptive_capable(model: &str) -> bool {
+    ADAPTIVE_THINKING_MODELS.iter().any(|m| model.contains(m))
+}
+
+/// Legacy fixed-budget thinking, for models that predate adaptive thinking.
+/// 1024 is Anthropic's documented minimum; values chosen conservatively below
+/// our 16000 max_tokens ceiling.
+fn budget_tokens(effort: Effort) -> u32 {
+    match effort {
+        Effort::Low => 1024,
+        Effort::Medium => 4096,
+        Effort::High => 10000,
+        Effort::None => 0,
+    }
+}
+
+fn effort_str(effort: Effort) -> Option<&'static str> {
+    match effort {
+        Effort::Low => Some("low"),
+        Effort::Medium => Some("medium"),
+        Effort::High => Some("high"),
+        Effort::None => None,
+    }
+}
+
+fn anthropic_thinking(model: &str, effort: Effort) -> Option<Value> {
+    let level = effort_str(effort)?;
+    if is_adaptive_capable(model) {
+        Some(json!({"type": "adaptive", "effort": level}))
+    } else {
+        Some(json!({"type": "enabled", "budget_tokens": budget_tokens(effort)}))
+    }
+}
+
 pub struct Anthropic;
 
 impl Provider for Anthropic {
@@ -68,7 +112,7 @@ impl Provider for Anthropic {
         tools
     }
 
-    fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value) -> Value {
+    fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value, effort: Effort) -> Value {
         // Stamp cache_control on the last content block of the last message so the
         // growing conversation tail is cached incrementally: each turn the previous
         // tail becomes a cache hit and the breakpoint moves forward. The task message
@@ -81,13 +125,21 @@ impl Provider for Anthropic {
                 last_block["cache_control"] = json!({"type": "ephemeral"});
             }
         }
-        json!({
+        let mut req = json!({
             "model":      model,
             "max_tokens": 16000,
             "system":     [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             "tools":      tools,
             "messages":   req_msgs,
-        })
+        });
+        // Opt-in only: Effort::None omits `thinking` entirely, preserving prior
+        // behavior. Adaptive thinking (`type: "adaptive"`) 400s on models that
+        // predate it, so we gate on model name and fall back to the legacy
+        // fixed-budget form for everything else.
+        if let Some(thinking) = anthropic_thinking(model, effort) {
+            req["thinking"] = thinking;
+        }
+        req
     }
 
     fn parse_response(&self, resp: Value) -> Result<ParsedResponse, String> {
@@ -199,17 +251,25 @@ impl Provider for OpenAI {
         json!(tools)
     }
 
-    fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value) -> Value {
+    fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value, effort: Effort) -> Value {
         let mut all_msgs = vec![json!({"role": "system", "content": system})];
         if let Some(arr) = messages.as_array() {
             all_msgs.extend(arr.iter().cloned());
         }
-        json!({
+        let mut req = json!({
             "model":      model,
             "max_tokens": 16000,
             "tools":      tools,
             "messages":   all_msgs,
-        })
+        });
+        // DeepSeek's thinking mode: {"type":"enabled","reasoning_effort":"high"|"max"}.
+        // DeepSeek itself coerces low/medium to high and xhigh to max, so we do the
+        // same rather than sending values it would silently remap anyway.
+        if effort != Effort::None {
+            let reasoning_effort = if effort == Effort::High { "max" } else { "high" };
+            req["thinking"] = json!({"type": "enabled", "reasoning_effort": reasoning_effort});
+        }
+        req
     }
 
     fn parse_response(&self, resp: Value) -> Result<ParsedResponse, String> {
@@ -238,8 +298,14 @@ impl Provider for OpenAI {
             }
         }
 
-        let assistant_msg =
+        // reasoning_content (DeepSeek thinking mode) must be preserved verbatim in
+        // tool-call history or the next request 400s — carry it through untouched
+        // when present; omitted entirely when absent (thinking disabled/unset).
+        let mut assistant_msg =
             json!({ "role": "assistant", "content": msg["content"], "tool_calls": msg["tool_calls"] });
+        if !msg["reasoning_content"].is_null() {
+            assistant_msg["reasoning_content"] = msg["reasoning_content"].clone();
+        }
 
         Ok(ParsedResponse {
             text_parts,
@@ -321,7 +387,7 @@ mod tests {
     fn anthropic_moves_breakpoint_to_last_block_and_stays_within_limit() {
         let base = json!([{"name":"a","description":"d","input_schema":{}}]);
         let tools = Anthropic.shape_tools(&base);
-        let req = Anthropic.build_request("m", "sys", &tools, &sample_messages());
+        let req = Anthropic.build_request("m", "sys", &tools, &sample_messages(), Effort::None);
 
         // Last message's last block is stamped.
         let msgs = req["messages"].as_array().unwrap();
@@ -338,7 +404,7 @@ mod tests {
         let msgs = sample_messages();
         let base = json!([{"name":"a","description":"d","input_schema":{}}]);
         let tools = Anthropic.shape_tools(&base);
-        let _ = Anthropic.build_request("m", "sys", &tools, &msgs);
+        let _ = Anthropic.build_request("m", "sys", &tools, &msgs, Effort::None);
         // The tool_result block in the original still has no cache_control.
         let tr = &msgs[2]["content"][0];
         assert!(tr.get("cache_control").is_none());
@@ -349,11 +415,71 @@ mod tests {
         let base = json!([{"name":"a","description":"d","input_schema":{"type":"object"}}]);
         let tools = OpenAI.shape_tools(&base);
         let msgs = json!([{"role":"user","content":"hi"}]);
-        let req = OpenAI.build_request("m", "sys", &tools, &msgs);
+        let req = OpenAI.build_request("m", "sys", &tools, &msgs, Effort::None);
         assert_eq!(count_cache_control(&req), 0);
         assert_eq!(req["messages"][0]["role"], "system");
         assert_eq!(req["tools"][0]["type"], "function");
         assert_eq!(req["tools"][0]["function"]["name"], "a");
+    }
+
+    #[test]
+    fn effort_none_omits_thinking_on_both_providers() {
+        let msgs = json!([]);
+        let anthropic_req = Anthropic.build_request("claude-opus-4-8", "sys", &json!([]), &msgs, Effort::None);
+        assert!(anthropic_req.get("thinking").is_none());
+        let openai_req = OpenAI.build_request("deepseek-v4-pro", "sys", &json!([]), &msgs, Effort::None);
+        assert!(openai_req.get("thinking").is_none());
+    }
+
+    #[test]
+    fn anthropic_adaptive_thinking_for_capable_model() {
+        let msgs = json!([]);
+        let req = Anthropic.build_request("claude-opus-4-8", "sys", &json!([]), &msgs, Effort::High);
+        assert_eq!(req["thinking"]["type"], "adaptive");
+        assert_eq!(req["thinking"]["effort"], "high");
+    }
+
+    #[test]
+    fn anthropic_legacy_budget_for_older_model() {
+        let msgs = json!([]);
+        let req = Anthropic.build_request(
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "sys",
+            &json!([]),
+            &msgs,
+            Effort::Low,
+        );
+        assert_eq!(req["thinking"]["type"], "enabled");
+        assert_eq!(req["thinking"]["budget_tokens"], 1024);
+        assert!(req["thinking"].get("effort").is_none());
+    }
+
+    #[test]
+    fn deepseek_reasoning_effort_maps_low_and_medium_to_high_and_high_to_max() {
+        let msgs = json!([]);
+        for (effort, expected) in [(Effort::Low, "high"), (Effort::Medium, "high"), (Effort::High, "max")] {
+            let req = OpenAI.build_request("deepseek-v4-pro", "sys", &json!([]), &msgs, effort);
+            assert_eq!(req["thinking"]["type"], "enabled");
+            assert_eq!(req["thinking"]["reasoning_effort"], expected, "effort={effort:?}");
+        }
+    }
+
+    #[test]
+    fn openai_parse_response_carries_reasoning_content_into_assistant_msg() {
+        let resp = json!({"choices":[{"message":{
+            "content": "",
+            "reasoning_content": "step by step...",
+            "tool_calls": [{"id":"c1","function":{"name":"run_shell","arguments":"{}"}}]
+        }}]});
+        let parsed = OpenAI.parse_response(resp).unwrap();
+        assert_eq!(parsed.assistant_msg["reasoning_content"], "step by step...");
+    }
+
+    #[test]
+    fn openai_parse_response_omits_reasoning_content_when_absent() {
+        let resp = json!({"choices":[{"message":{"content": "hi", "tool_calls": null}}]});
+        let parsed = OpenAI.parse_response(resp).unwrap();
+        assert!(parsed.assistant_msg.get("reasoning_content").is_none());
     }
 
     #[test]

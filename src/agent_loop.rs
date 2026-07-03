@@ -2,12 +2,12 @@
 //! the injected `Policy` when to stop and how to label the result. A top-level
 //! run and a delegated sub-run are the same function with different config.
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::job::{FailureKind, Job, JobResult, Status};
+use crate::job::{Effort, FailureKind, Job, JobResult, Status};
 use crate::llm::LlmClient;
 use crate::policy::{Ending, Policy, Progress};
 use crate::provider::{Provider, ToolResult};
@@ -24,15 +24,32 @@ const MAX_INLINE_CHARS: usize = 16_000;
 pub struct Ctx<'a> {
     pub client: &'a dyn LlmClient,
     pub provider: &'a dyn Provider,
-    pub paths: &'a Paths,
+    pub paths: Paths,
     pub model: &'a str,
-    /// Tool-call budget for the current run only.
-    pub budget: Rc<Cell<usize>>,
+    /// Extended-reasoning effort for this run's model calls. `Effort::None` sends
+    /// no reasoning param at all — opt-in, matches prior behavior.
+    pub effort: Effort,
+    /// Tool-call budget for the current run only. `Arc<AtomicUsize>` (not
+    /// `Rc<Cell<_>>`) so `Ctx` can be shared (`&Ctx`, requires `Sync`) across the
+    /// scoped threads spawn_agent uses to run concurrent sub-agents — even though
+    /// each child gets its own fresh budget (never actually shared), the field's
+    /// type still has to satisfy `Sync` for `Ctx` as a whole to cross that boundary.
+    pub budget: Arc<AtomicUsize>,
     /// Starting tool-call budget handed to each delegated sub-agent (its own).
     pub sub_budget: usize,
-    /// Number of sub-agents delegated so far by the top-level run.
-    pub fanout: Rc<Cell<usize>>,
+    /// Number of sub-agents delegated so far by the top-level run. Genuinely
+    /// shared (same Arc cloned into every descendant), so mutated via a
+    /// compare-exchange loop wherever it's checked-then-incremented, never a
+    /// plain read-then-write — see spawn::handle.
+    pub fanout: Arc<AtomicUsize>,
     pub max_fanout: usize,
+    /// Sequential spawn-order counter for THIS run's own direct children, used
+    /// only to build their log labels (e.g. this run is "d1", its 3rd spawned
+    /// child is "d1-2") — distinct from `fanout`, which enforces the fan-out
+    /// cap; this is purely cosmetic numbering, reset fresh per run (each
+    /// spawned child gets its own fresh counter for ITS children, though
+    /// today's policy never lets a sub-agent spawn further).
+    pub spawn_index: Arc<AtomicUsize>,
 }
 
 /// Per-run configuration: what to do, how to steer, and where in the tree.
@@ -40,6 +57,16 @@ pub struct RunConfig {
     pub job: Job,
     pub policy: Policy,
     pub depth: usize,
+    /// Log label for this run, e.g. "d0" for the top-level run or "d1-2" for
+    /// the 3rd (0-indexed) sub-agent spawned directly by that top-level run.
+    /// Purely cosmetic — `depth` (not this) drives actual behavior (the
+    /// reconcile gate, tool-set shaping, delegation refusal below depth 0).
+    /// Distinct from `depth` because multiple sub-agents share the same
+    /// depth but must be told apart in logs — previously every sub-agent
+    /// printed as "d1", making it impossible to tell which log lines
+    /// belonged to which of several concurrently- or sequentially-run
+    /// sub-agents without cross-referencing AGENT_RUN_DIR paths by hand.
+    pub label: String,
     /// Conversation id for persistence; `None` means no own persistence.
     pub thread_id: Option<String>,
 }
@@ -65,11 +92,21 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         job,
         policy,
         depth,
+        label,
         thread_id,
     } = cfg;
 
     let system = build_system();
-    let task_text = format!("[run started: {}]\n{}", now(), render_task(&job));
+    // Every run — top-level or a nested sub-agent — learns its own scratchpad/
+    // spill directory this way, since sub-agents are recursive in-process calls
+    // (not new OS processes), so a single env var can't hold a distinct value
+    // per sub-agent the way it could for the top-level run alone.
+    let task_text = format!(
+        "[run started: {}]\nYour run directory: {}\n{}",
+        now(),
+        ctx.paths.dir().display(),
+        render_task(&job)
+    );
     let task_msg = json!({
         "role": "user",
         "content": [{"type": "text", "text": task_text, "cache_control": {"type": "ephemeral"}}]
@@ -79,9 +116,9 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
     // was in flight when a previous process died).
     let mut history: Vec<Value> = match &thread_id {
         Some(tid) => {
-            let mut hist = thread::load_thread(ctx.paths, tid);
+            let mut hist = thread::load_thread(&ctx.paths);
             if !hist.is_empty() {
-                eprintln!("[agent d{depth}] resuming {tid} ({} prior messages)", hist.len());
+                eprintln!("[agent {label}] resuming {tid} ({} prior messages)", hist.len());
             }
             if depth == 0 {
                 reconcile(ctx, tid, &mut hist);
@@ -105,7 +142,7 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         let prog = Progress {
             iter,
             max_iter: job.max_iter,
-            budget_remaining: ctx.budget.get(),
+            budget_remaining: ctx.budget.load(Ordering::Relaxed),
             steps_taken,
             last_text: &last_text,
             checks: &job.checks,
@@ -119,14 +156,14 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
             break;
         }
 
-        eprintln!("[agent d{depth}] iter {}", iter + 1);
+        eprintln!("[agent {label}] iter {}", iter + 1);
         let resp = match ctx
             .client
-            .call(ctx.provider, ctx.model, &mut messages, &system, &tool_set)
+            .call(ctx.provider, ctx.model, &mut messages, &system, &tool_set, ctx.effort)
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[agent d{depth}] llm error: {e}");
+                eprintln!("[agent {label}] llm error: {e}");
                 ending = Ending::Failed;
                 break;
             }
@@ -134,7 +171,7 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         let parsed = match ctx.provider.parse_response(resp) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[agent d{depth}] parse error: {e}");
+                eprintln!("[agent {label}] parse error: {e}");
                 ending = Ending::Failed;
                 break;
             }
@@ -146,35 +183,81 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
 
         let had_tool_calls = !parsed.tool_calls.is_empty();
         if (policy.is_done)(had_tool_calls) {
-            if let Some(tid) = &thread_id {
+            if thread_id.is_some() {
                 let all = messages.as_array().unwrap();
-                thread::append_thread(ctx.paths, tid, &all[persisted_len..]);
+                thread::append_thread(&ctx.paths, &all[persisted_len..]);
             }
             ending = Ending::Stopped;
             break;
         }
 
+        // spawn_agent calls run concurrently with each other (each gets its own
+        // fresh context and budget, and its own nested Paths, so nothing about
+        // running them on separate threads is unsafe by construction) — every
+        // other tool call still runs sequentially, as before. Splitting the
+        // batch this way, rather than parallelizing everything, keeps run_shell/
+        // read_image/read_pdf (which have no reason to run concurrently here)
+        // simple while cutting the wall-clock cost of a turn that delegates to
+        // several independent sub-agents at once.
+        let (spawn_calls, other_calls): (Vec<_>, Vec<_>) =
+            parsed.tool_calls.iter().partition(|tc| tc.name == "spawn_agent");
+
         let mut results: Vec<ToolResult> = vec![];
-        for tc in &parsed.tool_calls {
-            let content = if ctx.budget.get() == 0 {
-                "[budget exhausted — could not run tool]".to_string()
-            } else {
-                ctx.budget.set(ctx.budget.get() - 1);
+        for tc in &other_calls {
+            let (content, took_step) =
+                run_one_tool(ctx, &policy, depth, &label, thread_id.as_deref(), tc);
+            if took_step {
                 steps_taken += 1;
-                dispatch_tool(ctx, &policy, depth, thread_id.as_deref(), tc)
-            };
+            }
             results.push(ToolResult {
                 tool_use_id: tc.id.clone(),
                 content,
             });
         }
 
+        if !spawn_calls.is_empty() {
+            let tid_ref = thread_id.as_deref();
+            let label_ref = label.as_str();
+            let outcomes: Vec<(String, String, bool)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = spawn_calls
+                    .iter()
+                    .map(|tc| {
+                        let tc = *tc;
+                        let policy = &policy;
+                        scope.spawn(move || {
+                            let (content, took_step) =
+                                run_one_tool(ctx, policy, depth, label_ref, tid_ref, tc);
+                            (tc.id.clone(), content, took_step)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            (
+                                "unknown".to_string(),
+                                "[spawn_agent thread panicked]".to_string(),
+                                false,
+                            )
+                        })
+                    })
+                    .collect()
+            });
+            for (id, content, took_step) in outcomes {
+                if took_step {
+                    steps_taken += 1;
+                }
+                results.push(ToolResult { tool_use_id: id, content });
+            }
+        }
+
         for m in ctx.provider.wrap_tool_results(results) {
             messages.as_array_mut().unwrap().push(m);
         }
-        if let Some(tid) = &thread_id {
+        if thread_id.is_some() {
             let all = messages.as_array().unwrap();
-            thread::append_thread(ctx.paths, tid, &all[persisted_len..]);
+            thread::append_thread(&ctx.paths, &all[persisted_len..]);
             persisted_len = all.len();
         }
         iter += 1;
@@ -184,7 +267,7 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
     let prog = Progress {
         iter,
         max_iter: job.max_iter,
-        budget_remaining: ctx.budget.get(),
+        budget_remaining: ctx.budget.load(Ordering::Relaxed),
         steps_taken,
         last_text: &last_text,
         checks: &job.checks,
@@ -210,42 +293,73 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
     }
 }
 
+/// Check-and-decrement the run's tool-call budget, then dispatch if any remains.
+/// Returns `(content, took_step)`. The check-then-decrement is a compare-exchange
+/// loop rather than a plain read-then-write because `budget` is an `AtomicUsize`
+/// that can now be raced by concurrently-running spawn_agent calls in the same
+/// turn — a naive get/set pair could let two callers both observe budget > 0 and
+/// both decrement, undercounting the exhaustion point.
+fn run_one_tool(
+    ctx: &Ctx,
+    policy: &Policy,
+    depth: usize,
+    label: &str,
+    thread_id: Option<&str>,
+    tc: &crate::provider::ToolCall,
+) -> (String, bool) {
+    loop {
+        let cur = ctx.budget.load(Ordering::Relaxed);
+        if cur == 0 {
+            return ("[budget exhausted — could not run tool]".to_string(), false);
+        }
+        if ctx
+            .budget
+            .compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return (dispatch_tool(ctx, policy, depth, label, thread_id, tc), true);
+        }
+        // Lost the race to a concurrent caller — reload and retry.
+    }
+}
+
 /// Dispatch one tool call to its implementation, returning the tool result text.
 fn dispatch_tool(
     ctx: &Ctx,
     policy: &Policy,
     depth: usize,
+    label: &str,
     thread_id: Option<&str>,
     tc: &crate::provider::ToolCall,
 ) -> String {
     match tc.name.as_str() {
         "run_shell" => {
             let cmd = tc.input["command"].as_str().unwrap_or("");
-            eprintln!("[agent d{depth}] run_shell: {cmd}");
-            finalize(ctx.paths, &tc.id, tools::run_shell(cmd))
+            eprintln!("[agent {label}] run_shell: {cmd}");
+            finalize(&ctx.paths, &tc.id, tools::run_shell(cmd))
         }
         "read_image" => {
             let path = tc.input["path"].as_str().unwrap_or("");
-            eprintln!("[agent d{depth}] read_image: {path}");
+            eprintln!("[agent {label}] read_image: {path}");
             let q = tc.input["question"]
                 .as_str()
                 .unwrap_or("Extract all text and data from this image verbatim.");
-            finalize(ctx.paths, &tc.id, tools::read_image(path, q))
+            finalize(&ctx.paths, &tc.id, tools::read_image(path, q))
         }
         "read_pdf" => {
             let path = tc.input["path"].as_str().unwrap_or("");
-            eprintln!("[agent d{depth}] read_pdf: {path}");
+            eprintln!("[agent {label}] read_pdf: {path}");
             let q = tc.input["question"]
                 .as_str()
                 .unwrap_or("Extract all text and data from this PDF verbatim.");
-            finalize(ctx.paths, &tc.id, tools::read_pdf(path, q))
+            finalize(&ctx.paths, &tc.id, tools::read_pdf(path, q))
         }
         "spawn_agent" => {
             if !policy.may_delegate || depth >= 1 {
                 let r = JobResult::blocked(&crate::job::new_id(), FailureKind::ToolUnavailable, 0);
                 return r.to_json();
             }
-            spawn::handle(ctx, depth, thread_id, &tc.input).to_json()
+            spawn::handle(ctx, depth, label, thread_id, &tc.input).to_json()
         }
         other => format!("unknown tool: {other}"),
     }
@@ -279,7 +393,7 @@ fn finalize(paths: &Paths, id: &str, raw: String) -> String {
 /// fold each result back into the conversation. Idempotent: safe to run on every
 /// start, and skips any job whose result is already committed to the conversation.
 fn reconcile(ctx: &Ctx, parent_tid: &str, history: &mut Vec<Value>) {
-    let records = registry::load(ctx.paths, parent_tid);
+    let records = registry::load(&ctx.paths);
     if records.is_empty() {
         return;
     }
@@ -294,18 +408,39 @@ fn reconcile(ctx: &Ctx, parent_tid: &str, history: &mut Vec<Value>) {
         let result = match done.get(&job.id) {
             Some(r) => r.clone(),
             None => {
-                eprintln!("[agent d0] resuming in-flight job {}", job.id);
+                let child_index = ctx.spawn_index.fetch_add(1, Ordering::Relaxed);
+                let child_label = format!("d1-{child_index}");
+                eprintln!("[agent {child_label}] resuming in-flight job {}", job.id);
                 let child_tid = thread::child_thread_id(parent_tid, &job.id);
+                // Reconstruct the exact directory spawn::handle would have used for
+                // this child — for_child is a pure function of parent dir + job id,
+                // so this reproduces it deterministically without persisting it
+                // separately. Match spawn::handle's effort (job's own, not the
+                // parent run's) — budget/fanout reuse the parent ctx here as before
+                // this change.
+                let resumed_ctx = Ctx {
+                    client: ctx.client,
+                    provider: ctx.provider,
+                    paths: Paths::for_child(&ctx.paths, &job.id),
+                    model: ctx.model,
+                    effort: job.effort,
+                    budget: ctx.budget.clone(),
+                    sub_budget: ctx.sub_budget,
+                    fanout: ctx.fanout.clone(),
+                    max_fanout: ctx.max_fanout,
+                    spawn_index: Arc::new(AtomicUsize::new(0)),
+                };
                 let r = run(
-                    ctx,
+                    &resumed_ctx,
                     RunConfig {
                         job: job.clone(),
                         policy: crate::policy::sub_policy(),
                         depth: 1,
+                        label: child_label,
                         thread_id: Some(child_tid),
                     },
                 );
-                registry::append_result(ctx.paths, parent_tid, &r);
+                registry::append_result(&ctx.paths, &r);
                 r
             }
         };
@@ -320,7 +455,7 @@ fn reconcile(ctx: &Ctx, parent_tid: &str, history: &mut Vec<Value>) {
         let mut committed = vec![assistant];
         committed.extend(tool_msgs);
         history.extend(committed.iter().cloned());
-        thread::append_thread(ctx.paths, parent_tid, &committed);
+        thread::append_thread(&ctx.paths, &committed);
     }
 }
 
@@ -339,7 +474,7 @@ fn system_prompt() -> String {
     let path = format!("{dir}/system.md");
     std::fs::read_to_string(&path)
         .unwrap_or_else(|_| {
-            format!("You are a task-executing ai-agent. On your first action, run: cat {dir}/CLAUDE.md")
+            format!("You are a task-executing ai-agent. On your first action, run: cat {dir}/skills/0-claude.md")
         })
         .replace("{AGENT_DIR}", &dir)
 }
@@ -370,16 +505,19 @@ mod tests {
     use crate::job::Persistence;
     use crate::policy::{root_policy, sub_policy};
     use crate::provider::Anthropic;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
-    /// A scripted client: returns queued responses in order.
+    /// A scripted client: returns queued responses in order. `Mutex`, not
+    /// `RefCell`, because `LlmClient` now requires `Send + Sync` (so `Ctx` can
+    /// cross the scoped threads spawn_agent uses) — this is a compile-time
+    /// requirement of the trait bound, not a sign these tests run concurrently.
     struct ScriptedClient {
-        responses: RefCell<Vec<Value>>,
+        responses: Mutex<Vec<Value>>,
     }
     impl ScriptedClient {
         fn new(responses: Vec<Value>) -> ScriptedClient {
             ScriptedClient {
-                responses: RefCell::new(responses),
+                responses: Mutex::new(responses),
             }
         }
     }
@@ -391,8 +529,9 @@ mod tests {
             _msgs: &mut Value,
             _s: &str,
             _t: &Value,
+            _effort: Effort,
         ) -> Result<Value, String> {
-            let mut q = self.responses.borrow_mut();
+            let mut q = self.responses.lock().unwrap();
             if q.is_empty() {
                 Err("no scripted response".into())
             } else {
@@ -411,7 +550,7 @@ mod tests {
     fn ctx<'a>(
         client: &'a dyn LlmClient,
         provider: &'a dyn Provider,
-        paths: &'a Paths,
+        paths: Paths,
         budget: usize,
     ) -> Ctx<'a> {
         Ctx {
@@ -419,10 +558,12 @@ mod tests {
             provider,
             paths,
             model: "m",
-            budget: Rc::new(Cell::new(budget)),
+            effort: Effort::None,
+            budget: Arc::new(AtomicUsize::new(budget)),
             sub_budget: budget,
-            fanout: Rc::new(Cell::new(0)),
+            fanout: Arc::new(AtomicUsize::new(0)),
             max_fanout: 8,
+            spawn_index: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -433,13 +574,13 @@ mod tests {
     #[test]
     fn single_turn_no_tools_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
         let client = ScriptedClient::new(vec![text_turn("all done")]);
         let provider = Anthropic;
-        let c = ctx(&client, &provider, &paths, 100);
+        let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
-            RunConfig { job: job(5), policy: root_policy(), depth: 0, thread_id: None },
+            RunConfig { job: job(5), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
         );
         assert_eq!(r.status, Status::Success);
         assert_eq!(r.output.as_deref(), Some("all done"));
@@ -451,16 +592,17 @@ mod tests {
         // No tool calls, but a thread id is set: the terminal branch must persist
         // the task message and the assistant reply (persisted_len still at start).
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
         let client = ScriptedClient::new(vec![text_turn("done, no tools")]);
         let provider = Anthropic;
-        let c = ctx(&client, &provider, &paths, 100);
+        let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
             RunConfig {
                 job: job(5),
                 policy: root_policy(),
                 depth: 0,
+                label: "d0".to_string(),
                 thread_id: Some("t".into()),
             },
         );
@@ -468,7 +610,7 @@ mod tests {
         assert_eq!(r.output.as_deref(), Some("done, no tools"));
         assert_eq!(r.steps_taken, 0);
 
-        let saved = thread::load_thread(&paths, "t");
+        let saved = thread::load_thread(&paths);
         assert_eq!(saved.len(), 2, "task message + assistant reply persisted");
         assert_eq!(saved[0]["role"], "user");
         assert_eq!(saved[1]["role"], "assistant");
@@ -477,23 +619,55 @@ mod tests {
     #[test]
     fn runs_a_tool_then_finishes() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
         let client = ScriptedClient::new(vec![shell_turn("t1", "printf hi"), text_turn("got hi")]);
         let provider = Anthropic;
-        let c = ctx(&client, &provider, &paths, 100);
+        let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
-            RunConfig { job: job(5), policy: root_policy(), depth: 0, thread_id: None },
+            RunConfig { job: job(5), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
         );
         assert_eq!(r.status, Status::Success);
         assert_eq!(r.steps_taken, 1);
-        assert_eq!(c.budget.get(), 99); // one tool call consumed
+        assert_eq!(c.budget.load(Ordering::Relaxed), 99); // one tool call consumed
+    }
+
+    #[test]
+    fn two_spawn_agent_calls_in_one_turn_run_concurrently_and_fanout_is_exact() {
+        // The orchestrator issues two spawn_agent tool_use blocks in a single
+        // assistant turn; each child gets its own thread (agent_loop::run splits
+        // spawn_agent calls out of the sequential dispatch loop and runs them via
+        // std::thread::scope). Both must complete, and the shared fanout counter
+        // must land at exactly 2 — not under- or over-counted by the concurrency.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let client = ScriptedClient::new(vec![
+            json!({"content": [
+                {"type":"tool_use","id":"s1","name":"spawn_agent","input":{"task":"metadata+headings"}},
+                {"type":"tool_use","id":"s2","name":"spawn_agent","input":{"task":"body paragraphs"}}
+            ]}),
+            // Each child consumes one of these from the shared, mutex-backed
+            // queue — order between the two concurrently-running children is
+            // non-deterministic, so the test only asserts aggregate outcomes.
+            text_turn("child done"),
+            text_turn("child done"),
+            text_turn("parent wraps up"),
+        ]);
+        let provider = Anthropic;
+        let c = ctx(&client, &provider, paths.clone(), 100);
+        let r = run(
+            &c,
+            RunConfig { job: job(5), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
+        );
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(c.fanout.load(Ordering::Relaxed), 2);
+        assert_eq!(r.steps_taken, 2);
     }
 
     #[test]
     fn iter_exhaustion_yields_partial() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
         // Always asks for another shell call; never stops.
         let client = ScriptedClient::new(vec![
             shell_turn("a", "true"),
@@ -501,10 +675,10 @@ mod tests {
             shell_turn("c", "true"),
         ]);
         let provider = Anthropic;
-        let c = ctx(&client, &provider, &paths, 100);
+        let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
-            RunConfig { job: job(2), policy: root_policy(), depth: 0, thread_id: None },
+            RunConfig { job: job(2), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
         );
         assert_eq!(r.status, Status::Partial);
         assert_eq!(r.failure, Some(FailureKind::BudgetExceeded));
@@ -513,28 +687,28 @@ mod tests {
     #[test]
     fn budget_exhaustion_yields_partial() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
         let client = ScriptedClient::new(vec![shell_turn("a", "true"), shell_turn("b", "true")]);
         let provider = Anthropic;
-        let c = ctx(&client, &provider, &paths, 1); // only one tool call allowed
+        let c = ctx(&client, &provider, paths.clone(), 1); // only one tool call allowed
         let r = run(
             &c,
-            RunConfig { job: job(10), policy: root_policy(), depth: 0, thread_id: None },
+            RunConfig { job: job(10), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
         );
         assert_eq!(r.status, Status::Partial);
-        assert_eq!(c.budget.get(), 0);
+        assert_eq!(c.budget.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn llm_error_yields_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
         let client = ScriptedClient::new(vec![]); // errors immediately
         let provider = Anthropic;
-        let c = ctx(&client, &provider, &paths, 100);
+        let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
-            RunConfig { job: job(5), policy: root_policy(), depth: 0, thread_id: None },
+            RunConfig { job: job(5), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
         );
         assert_eq!(r.status, Status::Failure);
         assert!(r.output.is_none());
@@ -543,20 +717,21 @@ mod tests {
     #[test]
     fn conversation_persists_atomically_across_rounds() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
         let client = ScriptedClient::new(vec![shell_turn("t1", "printf hi"), text_turn("done")]);
         let provider = Anthropic;
-        let c = ctx(&client, &provider, &paths, 100);
+        let c = ctx(&client, &provider, paths.clone(), 100);
         let _ = run(
             &c,
             RunConfig {
                 job: job(5),
                 policy: root_policy(),
                 depth: 0,
+                label: "d0".to_string(),
                 thread_id: Some("persist".into()),
             },
         );
-        let saved = thread::load_thread(&paths, "persist");
+        let saved = thread::load_thread(&paths);
         // Every assistant tool_use has its tool_result present: no dangling call.
         let has_toolu = saved.iter().any(|m| {
             m["content"]
@@ -571,14 +746,15 @@ mod tests {
     fn sub_policy_blocks_delegation() {
         // At depth 1 the delegation attempt is refused with a typed blocked result.
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
         let client = ScriptedClient::new(vec![]);
         let provider = Anthropic;
-        let c = ctx(&client, &provider, &paths, 100);
+        let c = ctx(&client, &provider, paths.clone(), 100);
         let out = dispatch_tool(
             &c,
             &sub_policy(),
             1,
+            "d1-0",
             None,
             &crate::provider::ToolCall {
                 id: "x".into(),
@@ -592,13 +768,13 @@ mod tests {
     #[test]
     fn durable_resume_reconciles_into_conversation_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
         let provider = Anthropic;
 
         // A durable job was issued but never completed (process died mid-run):
         // registry has the issue line, no result; conversation has no tool_result.
         let pending = Job::new("long subtask".into(), vec![], Persistence::Durable, 10);
-        registry::append_issued(&paths, "main", &pending);
+        registry::append_issued(&paths, &pending);
         let synth_id = format!("toolu_{}", pending.id);
 
         // First start: reconcile resumes the child (1st response), then the
@@ -607,23 +783,24 @@ mod tests {
             json!({"content":[{"type":"text","text":"child recovered"}]}),
             json!({"content":[{"type":"text","text":"parent done"}]}),
         ]);
-        let c = ctx(&client, &provider, &paths, 100);
+        let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
             RunConfig {
                 job: job(5),
                 policy: root_policy(),
                 depth: 0,
+                label: "d0".to_string(),
                 thread_id: Some("main".into()),
             },
         );
         assert_eq!(r.status, Status::Success);
 
         // Conversation now has a valid tool_use + tool_result pair for the job.
-        let convo = json!(thread::load_thread(&paths, "main"));
+        let convo = json!(thread::load_thread(&paths));
         assert!(provider.has_tool_result(&convo, &synth_id), "result not committed");
         // Registry closed out: nothing left in flight.
-        let recs = registry::load(&paths, "main");
+        let recs = registry::load(&paths);
         assert!(registry::in_flight(&recs).is_empty());
 
         // Second start with the same thread: reconcile must be a no-op (result
@@ -631,19 +808,20 @@ mod tests {
         let client2 = ScriptedClient::new(vec![
             json!({"content":[{"type":"text","text":"parent again"}]}),
         ]);
-        let c2 = ctx(&client2, &provider, &paths, 100);
+        let c2 = ctx(&client2, &provider, paths.clone(), 100);
         let r2 = run(
             &c2,
             RunConfig {
                 job: job(5),
                 policy: root_policy(),
                 depth: 0,
+                label: "d0".to_string(),
                 thread_id: Some("main".into()),
             },
         );
         assert_eq!(r2.status, Status::Success);
         // No duplicate result appended by the idempotent second pass.
-        let result_lines = registry::load(&paths, "main")
+        let result_lines = registry::load(&paths)
             .iter()
             .filter(|rec| matches!(rec, registry::Record::Result { .. }))
             .count();

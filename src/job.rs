@@ -32,6 +32,29 @@ impl Persistence {
     }
 }
 
+/// How much extended reasoning/thinking to request from the model for a run.
+/// Opt-in: `None` sends no reasoning param at all, matching prior behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    /// Parse a tool argument or env var value; defaults to `None`.
+    pub fn parse(s: Option<&str>) -> Effort {
+        match s {
+            Some("low") => Effort::Low,
+            Some("medium") => Effort::Medium,
+            Some("high") => Effort::High,
+            _ => Effort::None,
+        }
+    }
+}
+
 /// One high-level step describing intent (WHAT, not HOW).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
@@ -52,11 +75,19 @@ pub struct Job {
     pub checks: Vec<String>,
     #[serde(default = "default_persistence")]
     pub persistence: Persistence,
+    #[serde(default)]
+    pub effort: Effort,
     pub max_iter: usize,
 }
 
 fn default_persistence() -> Persistence {
     Persistence::Ephemeral
+}
+
+impl Default for Effort {
+    fn default() -> Effort {
+        Effort::None
+    }
 }
 
 impl Job {
@@ -68,6 +99,7 @@ impl Job {
             steps: Vec::new(),
             checks,
             persistence,
+            effort: Effort::None,
             max_iter,
         }
     }
