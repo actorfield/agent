@@ -29,7 +29,9 @@ pub struct ToolResult {
     pub content: String,
 }
 
-pub trait Provider {
+/// `Send + Sync` so a `Ctx` holding `&dyn Provider` can be shared across the
+/// scoped threads spawn_agent uses to run concurrent sub-agents.
+pub trait Provider: Send + Sync {
     /// Shape the neutral tool list into the provider's request format.
     fn shape_tools(&self, base: &Value) -> Value;
     fn build_request(&self, model: &str, system: &str, tools: &Value, messages: &Value, effort: Effort) -> Value;

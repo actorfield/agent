@@ -10,11 +10,26 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::job::{Job, JobResult};
 use crate::thread::Paths;
+
+/// Serializes registry-file appends process-wide. Needed now that concurrently
+/// running sub-agents (agent_loop::run dispatches spawn_agent calls on separate
+/// threads) can complete at the same time and each call append_issued/
+/// append_result against the SAME parent registry.jsonl — `OpenOptions::append`
+/// alone does not guarantee non-interleaved writes across threads. A single
+/// process-wide lock (rather than one per parent path) is simplest and costs
+/// nothing measurable: registry appends are rare (once per durable spawn, not
+/// per LLM round-trip) and this binary only ever runs one top-level job per
+/// process, so there is no real unrelated-runs contention to optimize away.
+fn write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// One append-only registry line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,14 +39,13 @@ pub enum Record {
     Result { id: String, result: JobResult },
 }
 
-pub fn append_issued(paths: &Paths, parent_thread_id: &str, job: &Job) {
-    append(paths, parent_thread_id, &Record::Issued { job: job.clone() });
+pub fn append_issued(paths: &Paths, job: &Job) {
+    append(paths, &Record::Issued { job: job.clone() });
 }
 
-pub fn append_result(paths: &Paths, parent_thread_id: &str, result: &JobResult) {
+pub fn append_result(paths: &Paths, result: &JobResult) {
     append(
         paths,
-        parent_thread_id,
         &Record::Result {
             id: result.id.clone(),
             result: result.clone(),
@@ -39,8 +53,9 @@ pub fn append_result(paths: &Paths, parent_thread_id: &str, result: &JobResult) 
     );
 }
 
-fn append(paths: &Paths, parent_thread_id: &str, record: &Record) {
-    let path = paths.registry_path(parent_thread_id);
+fn append(paths: &Paths, record: &Record) {
+    let _guard = write_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let path = paths.registry_path();
     let mut file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -57,8 +72,8 @@ fn append(paths: &Paths, parent_thread_id: &str, record: &Record) {
     }
 }
 
-pub fn load(paths: &Paths, parent_thread_id: &str) -> Vec<Record> {
-    let path = paths.registry_path(parent_thread_id);
+pub fn load(paths: &Paths) -> Vec<Record> {
+    let path = paths.registry_path();
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return vec![];
     };
@@ -114,11 +129,11 @@ mod tests {
     #[test]
     fn append_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
         let j = job("a");
-        append_issued(&paths, "main", &j);
-        append_result(&paths, "main", &JobResult::success(&j.id, "ok".into(), 2));
-        let recs = load(&paths, "main");
+        append_issued(&paths, &j);
+        append_result(&paths, &JobResult::success(&j.id, "ok".into(), 2));
+        let recs = load(&paths);
         assert_eq!(recs.len(), 2);
     }
 
@@ -169,7 +184,7 @@ mod tests {
     #[test]
     fn missing_registry_loads_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path().to_path_buf());
-        assert!(load(&paths, "none").is_empty());
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        assert!(load(&paths).is_empty());
     }
 }

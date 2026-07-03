@@ -29,7 +29,9 @@ pub fn llm_request(url: &str) -> ureq::Request {
 }
 
 /// One call to the model: send `messages`, return the raw response.
-pub trait LlmClient {
+/// `Send + Sync` so a `Ctx` holding `&dyn LlmClient` can be shared across the
+/// scoped threads spawn_agent uses to run concurrent sub-agents.
+pub trait LlmClient: Send + Sync {
     fn call(
         &self,
         provider: &dyn Provider,
@@ -68,7 +70,10 @@ fn decide(attempt: &Attempt) -> Next {
                 Next::Fail(format!("HTTP 400: {}", clip(body)))
             }
         }
-        Attempt::Status(502, body) => Next::Retry(format!("HTTP 502: {}", clip(body))),
+        Attempt::Status(429, body) => Next::Retry(format!("HTTP 429: {}", clip(body))),
+        Attempt::Status(code, body) if (500..600).contains(code) => {
+            Next::Retry(format!("HTTP {code}: {}", clip(body)))
+        }
         Attempt::Status(code, body) => Next::Fail(format!("HTTP {code}: {}", clip(body))),
         Attempt::Network(msg) => {
             if msg.contains("NetworkError") || msg.contains("Connection") {
@@ -191,14 +196,23 @@ mod tests {
     }
 
     #[test]
-    fn server_502_retries() {
-        let a = Attempt::Status(502, "bad gateway".into());
+    fn server_5xx_retries() {
+        for code in [500, 502, 503, 504, 599] {
+            let a = Attempt::Status(code, "server error".into());
+            assert!(matches!(decide(&a), Next::Retry(_)), "expected retry for {code}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_429_retries() {
+        let a = Attempt::Status(429, "rate limited".into());
         assert!(matches!(decide(&a), Next::Retry(_)));
     }
 
     #[test]
     fn other_status_fails() {
         assert!(matches!(decide(&Attempt::Status(403, "no".into())), Next::Fail(_)));
+        assert!(matches!(decide(&Attempt::Status(404, "no".into())), Next::Fail(_)));
     }
 
     #[test]
