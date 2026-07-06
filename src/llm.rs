@@ -9,7 +9,9 @@ use crate::job::Effort;
 use crate::provider::Provider;
 
 const DEFAULT_MODEL: &str = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
-const DEFAULT_LLM_URL: &str = "http://llm.aispec-system.svc.cluster.local/anthropic/v1/messages";
+// Fallback only — the endpoint is normally injected via LLM_URL. Defaults to the
+// canonical Anthropic Messages API (provider is inferred from the URL).
+const DEFAULT_LLM_URL: &str = "https://api.anthropic.com/v1/messages";
 
 pub fn llm_url() -> String {
     std::env::var("LLM_URL").unwrap_or_else(|_| DEFAULT_LLM_URL.to_string())

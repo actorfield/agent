@@ -100,7 +100,7 @@ The provider is inferred automatically from `LLM_URL`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_URL` | `http://llm.aispec-system.svc.cluster.local/anthropic/v1/messages` | LLM endpoint (in-cluster proxy) |
+| `LLM_URL` | `https://api.anthropic.com/v1/messages` | LLM endpoint (Anthropic-compatible; provider inferred from the URL) |
 | `LLM_MODEL` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Model ID |
 | `LLM_API_KEY` | — | API key (omit if auth is handled by proxy) |
 | `AGENT_DIR` | `/var/actor/.agent` | Path to system prompt + skills directory |
