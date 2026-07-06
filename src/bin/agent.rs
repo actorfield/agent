@@ -76,7 +76,12 @@ fn main() {
     // Job id is created up front so the run's own directory can be keyed by it —
     // every run has a job id regardless of whether it's durable/threaded.
     let job = Job::new(task, Vec::new(), Persistence::Ephemeral, max_iter);
-    let paths = Paths::for_root(&Paths::default_base(), &job.id);
+    // Key the top-level workspace by the thread id when one is given (via
+    // --thread), so a thread's JSONL + sub-agent tree persist at a stable path
+    // across invocations — the thread resumes (load_thread) and can be read back.
+    // Fall back to the job id for one-shot/ephemeral runs.
+    let root_key = thread_id.as_deref().unwrap_or(&job.id);
+    let paths = Paths::for_root(&Paths::default_base(), root_key);
 
     // Per-run tool-call budget: the top-level run and each sub-agent each get their
     // own fresh allowance of this size — no tree-wide pool.
