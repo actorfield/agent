@@ -30,6 +30,8 @@ pub enum Ending {
     Failed,
     /// Could not proceed (tool/precondition unavailable).
     Blocked,
+    /// Cancelled by external signal (cancel file).
+    Cancelled,
 }
 
 /// The injectable control bundle.
@@ -61,6 +63,7 @@ fn default_classify(end: Ending, _p: &Progress) -> (Status, Option<FailureKind>)
         Ending::BudgetExhausted => (Status::Partial, Some(FailureKind::BudgetExceeded)),
         Ending::Failed => (Status::Failure, Some(FailureKind::RetrievalFailed)),
         Ending::Blocked => (Status::Blocked, Some(FailureKind::ToolUnavailable)),
+        Ending::Cancelled => (Status::Partial, Some(FailureKind::BudgetExceeded)),
     }
 }
 
