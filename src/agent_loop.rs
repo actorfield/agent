@@ -118,7 +118,10 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         Some(tid) => {
             let mut hist = thread::load_thread(&ctx.paths);
             if !hist.is_empty() {
-                eprintln!("[agent {label}] resuming {tid} ({} prior messages)", hist.len());
+                eprintln!(
+                    "[agent {label}] resuming {tid} ({} prior messages)",
+                    hist.len()
+                );
             }
             if depth == 0 {
                 reconcile(ctx, tid, &mut hist);
@@ -139,6 +142,12 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
     let ending;
 
     loop {
+        // Check for external cancellation signal (written by cancel-agent handler).
+        if ctx.paths.dir().join("cancel").exists() {
+            eprintln!("[agent {label}] cancelled by signal");
+            ending = Ending::Cancelled;
+            break;
+        }
         let prog = Progress {
             iter,
             max_iter: job.max_iter,
@@ -157,10 +166,14 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         }
 
         eprintln!("[agent {label}] iter {}", iter + 1);
-        let resp = match ctx
-            .client
-            .call(ctx.provider, ctx.model, &mut messages, &system, &tool_set, ctx.effort)
-        {
+        let resp = match ctx.client.call(
+            ctx.provider,
+            ctx.model,
+            &mut messages,
+            &system,
+            &tool_set,
+            ctx.effort,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[agent {label}] llm error: {e}");
@@ -199,8 +212,10 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         // read_image/read_pdf (which have no reason to run concurrently here)
         // simple while cutting the wall-clock cost of a turn that delegates to
         // several independent sub-agents at once.
-        let (spawn_calls, other_calls): (Vec<_>, Vec<_>) =
-            parsed.tool_calls.iter().partition(|tc| tc.name == "spawn_agent");
+        let (spawn_calls, other_calls): (Vec<_>, Vec<_>) = parsed
+            .tool_calls
+            .iter()
+            .partition(|tc| tc.name == "spawn_agent");
 
         let mut results: Vec<ToolResult> = vec![];
         for tc in &other_calls {
@@ -248,7 +263,10 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
                 if took_step {
                     steps_taken += 1;
                 }
-                results.push(ToolResult { tool_use_id: id, content });
+                results.push(ToolResult {
+                    tool_use_id: id,
+                    content,
+                });
             }
         }
 
@@ -317,7 +335,10 @@ fn run_one_tool(
             .compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            return (dispatch_tool(ctx, policy, depth, label, thread_id, tc), true);
+            return (
+                dispatch_tool(ctx, policy, depth, label, thread_id, tc),
+                true,
+            );
         }
         // Lost the race to a concurrent caller — reload and retry.
     }
@@ -492,7 +513,11 @@ fn inject_skills() -> String {
         paths.sort();
         for path in paths {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                out.push_str(&format!("\n\n---\n## SKILL — {}\n\n{}", path.display(), content));
+                out.push_str(&format!(
+                    "\n\n---\n## SKILL — {}\n\n{}",
+                    path.display(),
+                    content
+                ));
             }
         }
     }
@@ -580,7 +605,13 @@ mod tests {
         let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
-            RunConfig { job: job(5), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: None,
+            },
         );
         assert_eq!(r.status, Status::Success);
         assert_eq!(r.output.as_deref(), Some("all done"));
@@ -625,7 +656,13 @@ mod tests {
         let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
-            RunConfig { job: job(5), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: None,
+            },
         );
         assert_eq!(r.status, Status::Success);
         assert_eq!(r.steps_taken, 1);
@@ -657,7 +694,13 @@ mod tests {
         let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
-            RunConfig { job: job(5), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: None,
+            },
         );
         assert_eq!(r.status, Status::Success);
         assert_eq!(c.fanout.load(Ordering::Relaxed), 2);
@@ -678,7 +721,13 @@ mod tests {
         let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
-            RunConfig { job: job(2), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
+            RunConfig {
+                job: job(2),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: None,
+            },
         );
         assert_eq!(r.status, Status::Partial);
         assert_eq!(r.failure, Some(FailureKind::BudgetExceeded));
@@ -693,7 +742,13 @@ mod tests {
         let c = ctx(&client, &provider, paths.clone(), 1); // only one tool call allowed
         let r = run(
             &c,
-            RunConfig { job: job(10), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
+            RunConfig {
+                job: job(10),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: None,
+            },
         );
         assert_eq!(r.status, Status::Partial);
         assert_eq!(c.budget.load(Ordering::Relaxed), 0);
@@ -708,7 +763,13 @@ mod tests {
         let c = ctx(&client, &provider, paths.clone(), 100);
         let r = run(
             &c,
-            RunConfig { job: job(5), policy: root_policy(), depth: 0, label: "d0".to_string(), thread_id: None },
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: None,
+            },
         );
         assert_eq!(r.status, Status::Failure);
         assert!(r.output.is_none());
@@ -798,7 +859,10 @@ mod tests {
 
         // Conversation now has a valid tool_use + tool_result pair for the job.
         let convo = json!(thread::load_thread(&paths));
-        assert!(provider.has_tool_result(&convo, &synth_id), "result not committed");
+        assert!(
+            provider.has_tool_result(&convo, &synth_id),
+            "result not committed"
+        );
         // Registry closed out: nothing left in flight.
         let recs = registry::load(&paths);
         assert!(registry::in_flight(&recs).is_empty());
