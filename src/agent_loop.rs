@@ -124,7 +124,7 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
                 );
             }
             if depth == 0 {
-                reconcile(ctx, tid, &mut hist);
+                reconcile(ctx, &policy, tid, &mut hist);
             }
             hist
         }
@@ -134,7 +134,23 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
     let mut messages = json!(history);
     let mut persisted_len = messages.as_array().unwrap().len() - 1;
 
-    let tool_set = ctx.provider.shape_tools(&tools::base_tool_defs(depth));
+    // Tool set: the policy may swap the builtin definitions for its own;
+    // spawn_agent is appended by the loop either way (delegation is loop
+    // infrastructure — an override can't grant it to sub-agents or drop it
+    // from the top level).
+    let base_defs = match policy.tool_defs {
+        Some(f) => {
+            let mut defs = f();
+            if depth == 0 {
+                if let Some(arr) = defs.as_array_mut() {
+                    arr.push(tools::spawn_agent_def());
+                }
+            }
+            defs
+        }
+        None => tools::base_tool_defs(depth),
+    };
+    let tool_set = ctx.provider.shape_tools(&base_defs);
 
     let mut steps_taken = 0usize;
     let mut last_text = String::new();
@@ -353,6 +369,16 @@ fn dispatch_tool(
     thread_id: Option<&str>,
     tc: &crate::provider::ToolCall,
 ) -> String {
+    // A policy dispatcher gets first refusal on every tool call except
+    // spawn_agent (delegation stays with the loop). None falls through.
+    if tc.name != "spawn_agent" {
+        if let Some(f) = policy.dispatch {
+            if let Some(out) = f(tc) {
+                eprintln!("[agent {label}] {} (policy dispatch)", tc.name);
+                return finalize(&ctx.paths, &tc.id, out);
+            }
+        }
+    }
     match tc.name.as_str() {
         "run_shell" => {
             let cmd = tc.input["command"].as_str().unwrap_or("");
@@ -380,7 +406,7 @@ fn dispatch_tool(
                 let r = JobResult::blocked(&crate::job::new_id(), FailureKind::ToolUnavailable, 0);
                 return r.to_json();
             }
-            spawn::handle(ctx, depth, label, thread_id, &tc.input).to_json()
+            spawn::handle(ctx, policy, depth, label, thread_id, &tc.input).to_json()
         }
         other => format!("unknown tool: {other}"),
     }
@@ -413,7 +439,7 @@ fn finalize(paths: &Paths, id: &str, raw: String) -> String {
 /// Resume durable jobs that were in flight when a previous process exited, and
 /// fold each result back into the conversation. Idempotent: safe to run on every
 /// start, and skips any job whose result is already committed to the conversation.
-fn reconcile(ctx: &Ctx, parent_tid: &str, history: &mut Vec<Value>) {
+fn reconcile(ctx: &Ctx, policy: &Policy, parent_tid: &str, history: &mut Vec<Value>) {
     let records = registry::load(&ctx.paths);
     if records.is_empty() {
         return;
@@ -455,7 +481,7 @@ fn reconcile(ctx: &Ctx, parent_tid: &str, history: &mut Vec<Value>) {
                     &resumed_ctx,
                     RunConfig {
                         job: job.clone(),
-                        policy: crate::policy::sub_policy(),
+                        policy: crate::policy::sub_policy_of(policy),
                         depth: 1,
                         label: child_label,
                         thread_id: Some(child_tid),
@@ -890,5 +916,148 @@ mod tests {
             .filter(|rec| matches!(rec, registry::Record::Result { .. }))
             .count();
         assert_eq!(result_lines, 1);
+    }
+
+    // ── policy tool overrides ────────────────────────────────────────────────
+
+    /// A client that records the tool set it was handed, then ends the run.
+    struct ToolRecordingClient {
+        seen: Mutex<Option<Value>>,
+    }
+    impl LlmClient for ToolRecordingClient {
+        fn call(
+            &self,
+            _p: &dyn Provider,
+            _m: &str,
+            _msgs: &mut Value,
+            _s: &str,
+            t: &Value,
+            _effort: Effort,
+        ) -> Result<Value, String> {
+            *self.seen.lock().unwrap() = Some(t.clone());
+            Ok(json!({"content":[{"type":"text","text":"done"}]}))
+        }
+    }
+
+    fn custom_defs() -> Value {
+        json!([{
+            "name": "custom_echo",
+            "description": "echo",
+            "input_schema": {"type":"object","properties":{},"required":[]}
+        }])
+    }
+
+    #[test]
+    fn tool_defs_override_replaces_builtins_and_keeps_spawn_agent_at_root() {
+        for (depth, wants_spawn) in [(0usize, true), (1usize, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::for_root_under(dir.path().to_path_buf());
+            let client = ToolRecordingClient {
+                seen: Mutex::new(None),
+            };
+            let provider = Anthropic;
+            let c = ctx(&client, &provider, paths, 100);
+            let policy = Policy {
+                tool_defs: Some(custom_defs),
+                ..root_policy()
+            };
+            run(
+                &c,
+                RunConfig {
+                    job: job(5),
+                    policy,
+                    depth,
+                    label: "d0".to_string(),
+                    thread_id: None,
+                },
+            );
+            let seen = client.seen.lock().unwrap().take().unwrap();
+            let names: Vec<&str> = seen
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap())
+                .collect();
+            assert!(names.contains(&"custom_echo"), "custom tool offered");
+            assert!(!names.contains(&"run_shell"), "builtins replaced");
+            assert_eq!(
+                names.contains(&"spawn_agent"),
+                wants_spawn,
+                "spawn_agent appended only at depth 0 (depth {depth})"
+            );
+        }
+    }
+
+    fn intercept_run_shell(tc: &crate::provider::ToolCall) -> Option<String> {
+        (tc.name == "run_shell").then(|| "INTERCEPTED".to_string())
+    }
+
+    fn never_intercept(_tc: &crate::provider::ToolCall) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn policy_dispatch_intercepts_before_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        // The command's OUTPUT ("x-zzz") differs from the command TEXT, so its
+        // absence proves the builtin never executed (the command text itself
+        // legitimately appears in the conversation as the tool_use input).
+        let client = ScriptedClient::new(vec![
+            shell_turn("t1", "printf x-%s zzz"),
+            text_turn("done"),
+        ]);
+        let provider = Anthropic;
+        let c = ctx(&client, &provider, paths.clone(), 100);
+        let policy = Policy {
+            dispatch: Some(intercept_run_shell),
+            ..root_policy()
+        };
+        let r = run(
+            &c,
+            RunConfig {
+                job: job(5),
+                policy,
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: Some("t".into()),
+            },
+        );
+        assert_eq!(r.status, Status::Success);
+        let hist = json!(thread::load_thread(&paths)).to_string();
+        assert!(hist.contains("INTERCEPTED"), "dispatcher output in convo");
+        assert!(
+            !hist.contains("x-zzz"),
+            "builtin run_shell must not have executed"
+        );
+    }
+
+    #[test]
+    fn policy_dispatch_none_falls_through_to_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let client = ScriptedClient::new(vec![
+            shell_turn("t1", "printf builtin-ran"),
+            text_turn("done"),
+        ]);
+        let provider = Anthropic;
+        let c = ctx(&client, &provider, paths.clone(), 100);
+        let policy = Policy {
+            dispatch: Some(never_intercept),
+            ..root_policy()
+        };
+        let r = run(
+            &c,
+            RunConfig {
+                job: job(5),
+                policy,
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: Some("t".into()),
+            },
+        );
+        assert_eq!(r.status, Status::Success);
+        let hist = json!(thread::load_thread(&paths)).to_string();
+        assert!(hist.contains("builtin-ran"), "fell through to builtin");
     }
 }

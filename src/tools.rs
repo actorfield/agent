@@ -57,7 +57,8 @@ Submits the entire PDF in a single API call (limit: 100 pages / 32 MB) — ask f
 
 /// The delegation tool. A top-level loop can hand a self-contained subtask to an
 /// isolated sub-agent that runs its own loop and returns a structured result.
-fn spawn_agent_def() -> Value {
+/// pub(crate): the loop also appends this to a policy-overridden tool set.
+pub(crate) fn spawn_agent_def() -> Value {
     json!({
         "name": "spawn_agent",
         "description": "Delegate a self-contained subtask to an isolated sub-agent. It runs its own \

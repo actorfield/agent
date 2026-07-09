@@ -10,13 +10,13 @@ use serde_json::{json, Value};
 
 use crate::agent_loop::{run, Ctx, RunConfig, DEFAULT_SUB_MAX_ITER};
 use crate::job::{Effort, FailureKind, Job, JobResult, Persistence};
-use crate::policy::sub_policy;
 use crate::thread::Paths;
 use crate::{registry, thread};
 
 /// Build a job from the tool arguments and run it as a sub-agent.
 pub fn handle(
     ctx: &Ctx,
+    parent_policy: &crate::policy::Policy,
     parent_depth: usize,
     parent_label: &str,
     parent_tid: Option<&str>,
@@ -109,7 +109,7 @@ pub fn handle(
         &child_ctx,
         RunConfig {
             job: job.clone(),
-            policy: sub_policy(),
+            policy: crate::policy::sub_policy_of(parent_policy),
             depth: parent_depth + 1,
             label: child_label,
             thread_id: child_tid,
@@ -219,7 +219,7 @@ mod tests {
         let client = ScriptedClient::new(vec![]);
         let provider = Anthropic;
         let c = mk_ctx(&client, &provider, paths, 100, 8, Arc::new(AtomicUsize::new(0)));
-        let r = handle(&c, 0, "d0", None, &json!({"task": "  "}));
+        let r = handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "  "}));
         assert_eq!(r.status, Status::Blocked);
     }
 
@@ -231,7 +231,7 @@ mod tests {
         let provider = Anthropic;
         let fanout = Arc::new(AtomicUsize::new(2));
         let c = mk_ctx(&client, &provider, paths, 100, 2, fanout);
-        let r = handle(&c, 0, "d0", None, &json!({"task": "do"}));
+        let r = handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "do"}));
         assert_eq!(r.status, Status::Partial);
         assert_eq!(r.failure, Some(FailureKind::BudgetExceeded));
     }
@@ -252,8 +252,8 @@ mod tests {
         let fanout = Arc::new(AtomicUsize::new(0));
         let c = mk_ctx(&client, &provider, paths, 100, 1, fanout.clone());
         let (r1, r2) = std::thread::scope(|scope| {
-            let h1 = scope.spawn(|| handle(&c, 0, "d0", None, &json!({"task": "x"})));
-            let h2 = scope.spawn(|| handle(&c, 0, "d0", None, &json!({"task": "y"})));
+            let h1 = scope.spawn(|| handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "x"})));
+            let h2 = scope.spawn(|| handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "y"})));
             (h1.join().unwrap(), h2.join().unwrap())
         });
         let successes = [&r1, &r2].iter().filter(|r| r.status == Status::Success).count();
@@ -273,7 +273,7 @@ mod tests {
         let client = ScriptedClient::new(vec![json!({"content":[{"type":"text","text":"sub done"}]})]);
         let provider = Anthropic;
         let c = mk_ctx(&client, &provider, paths.clone(), 100, 8, Arc::new(AtomicUsize::new(0)));
-        let r = handle(&c, 0, "d0", None, &json!({"task": "compute"}));
+        let r = handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "compute"}));
         assert_eq!(r.status, Status::Success);
         assert_eq!(r.output.as_deref(), Some("sub done"));
         // No registry writes for an ephemeral sub.
@@ -300,11 +300,11 @@ mod tests {
         let c = mk_ctx(&client, &provider, paths, 100, 8, Arc::new(AtomicUsize::new(0)));
 
         assert_eq!(c.spawn_index.load(Ordering::Relaxed), 0);
-        handle(&c, 0, "d0", None, &json!({"task": "one"}));
+        handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "one"}));
         assert_eq!(c.spawn_index.load(Ordering::Relaxed), 1);
-        handle(&c, 0, "d0", None, &json!({"task": "two"}));
+        handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "two"}));
         assert_eq!(c.spawn_index.load(Ordering::Relaxed), 2);
-        handle(&c, 0, "d0", None, &json!({"task": "three"}));
+        handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "three"}));
         assert_eq!(c.spawn_index.load(Ordering::Relaxed), 3);
     }
 
@@ -319,7 +319,7 @@ mod tests {
         let client = ScriptedClient::new(vec![json!({"content":[{"type":"text","text":"done"}]})]);
         let provider = Anthropic;
         let c = mk_ctx(&client, &provider, paths.clone(), 100, 8, Arc::new(AtomicUsize::new(0)));
-        let r = handle(&c, 0, "d0", None, &json!({"task": "fill section 2.0"}));
+        let r = handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "fill section 2.0"}));
         assert_eq!(r.status, Status::Success);
 
         // The task text sent to the model is the caller's task, verbatim — no
@@ -345,7 +345,7 @@ mod tests {
         let client = ScriptedClient::new(vec![json!({"content":[{"type":"text","text":"durable done"}]})]);
         let provider = Anthropic;
         let c = mk_ctx(&client, &provider, paths.clone(), 100, 8, Arc::new(AtomicUsize::new(0)));
-        let r = handle(&c, 0, "d0", Some("main"), &json!({"task":"long","persistence":"durable"}));
+        let r = handle(&c, &crate::policy::root_policy(), 0, "d0", Some("main"), &json!({"task":"long","persistence":"durable"}));
         assert_eq!(r.status, Status::Success);
         let recs = registry::load(&paths);
         assert_eq!(recs.len(), 2); // issued + result
@@ -375,7 +375,7 @@ mod tests {
             max_fanout: 8,
             spawn_index: Arc::new(AtomicUsize::new(0)),
         };
-        let r = handle(&c, 0, "d0", None, &json!({"task": "work"}));
+        let r = handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "work"}));
         assert_eq!(r.status, Status::Success);
         assert_eq!(r.steps_taken, 1); // sub spent its own budget, not the parent's
         assert_eq!(c.budget.load(Ordering::Relaxed), 0); // parent counter untouched
@@ -400,7 +400,7 @@ mod tests {
         let provider = Anthropic;
         let mut c = mk_ctx(&client, &provider, paths, 100, 8, Arc::new(AtomicUsize::new(0)));
         c.effort = Effort::High;
-        let r = handle(&c, 0, "d0", None, &json!({"task": "compute"}));
+        let r = handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "compute"}));
         assert_eq!(r.status, Status::Success);
         assert_eq!(client.seen_effort.lock().unwrap().as_slice(), &[Effort::High]);
     }
@@ -413,7 +413,7 @@ mod tests {
         let provider = Anthropic;
         let mut c = mk_ctx(&client, &provider, paths, 100, 8, Arc::new(AtomicUsize::new(0)));
         c.effort = Effort::High;
-        let r = handle(&c, 0, "d0", None, &json!({"task": "compute", "effort": "low"}));
+        let r = handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "compute", "effort": "low"}));
         assert_eq!(r.status, Status::Success);
         assert_eq!(client.seen_effort.lock().unwrap().as_slice(), &[Effort::Low]);
     }
@@ -429,7 +429,7 @@ mod tests {
         let provider = Anthropic;
         let mut c = mk_ctx(&client, &provider, paths, 100, 8, Arc::new(AtomicUsize::new(0)));
         c.effort = Effort::High;
-        let r = handle(&c, 0, "d0", None, &json!({"task": "compute", "effort": "none"}));
+        let r = handle(&c, &crate::policy::root_policy(), 0, "d0", None, &json!({"task": "compute", "effort": "none"}));
         assert_eq!(r.status, Status::Success);
         assert_eq!(client.seen_effort.lock().unwrap().as_slice(), &[Effort::None]);
     }
