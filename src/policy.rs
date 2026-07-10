@@ -5,6 +5,8 @@
 //! same loop with different bundles.
 
 use crate::job::{FailureKind, Status};
+use crate::provider::ToolCall;
+use serde_json::Value;
 
 /// A read-only view of the loop's progress, passed to the control functions.
 pub struct Progress<'a> {
@@ -46,6 +48,16 @@ pub struct Policy {
     pub classify: fn(Ending, &Progress) -> (Status, Option<FailureKind>),
     /// Requirements not satisfied by the run (empty when all hold).
     pub check: fn(&Progress) -> Vec<String>,
+    /// Optional replacement for the builtin tool definitions. When set, the
+    /// loop offers this array instead of the builtins; `spawn_agent` is still
+    /// appended by the loop itself at depth 0 (delegation stays structural,
+    /// not something an override can grant or revoke).
+    pub tool_defs: Option<fn() -> Value>,
+    /// Optional dispatcher consulted BEFORE the builtin match for each tool
+    /// call. `Some(result)` means the call was handled and `result` is the
+    /// tool output; `None` falls through to the builtin implementations.
+    /// `spawn_agent` is never routed here — delegation is loop infrastructure.
+    pub dispatch: Option<fn(&ToolCall) -> Option<String>>,
 }
 
 fn default_should_continue(p: &Progress) -> bool {
@@ -72,7 +84,7 @@ fn no_issues(_p: &Progress) -> Vec<String> {
     Vec::new()
 }
 
-/// Bundle for a top-level run: may delegate.
+/// Bundle for a top-level run: may delegate, builtin tools, builtin dispatch.
 pub fn root_policy() -> Policy {
     Policy {
         may_delegate: true,
@@ -80,6 +92,8 @@ pub fn root_policy() -> Policy {
         is_done: default_is_done,
         classify: default_classify,
         check: no_issues,
+        tool_defs: None,
+        dispatch: None,
     }
 }
 
@@ -88,6 +102,17 @@ pub fn sub_policy() -> Policy {
     Policy {
         may_delegate: false,
         ..root_policy()
+    }
+}
+
+/// Sub-agent bundle derived from a specific parent: may not delegate, and
+/// inherits the parent's tool overrides — a custom tool set or dispatcher
+/// applies to the whole run tree, not just the top level.
+pub fn sub_policy_of(parent: &Policy) -> Policy {
+    Policy {
+        tool_defs: parent.tool_defs,
+        dispatch: parent.dispatch,
+        ..sub_policy()
     }
 }
 
@@ -148,6 +173,28 @@ mod tests {
     fn check_reports_no_issues_by_default() {
         let p = root_policy();
         assert!((p.check)(&progress(1, 5, 5)).is_empty());
+    }
+
+    #[test]
+    fn sub_policy_of_inherits_tool_overrides() {
+        fn defs() -> Value {
+            serde_json::json!([])
+        }
+        fn disp(_tc: &ToolCall) -> Option<String> {
+            None
+        }
+        let parent = Policy {
+            tool_defs: Some(defs),
+            dispatch: Some(disp),
+            ..root_policy()
+        };
+        let child = sub_policy_of(&parent);
+        assert!(!child.may_delegate);
+        assert!(child.tool_defs.is_some(), "tool_defs inherited");
+        assert!(child.dispatch.is_some(), "dispatch inherited");
+        // A hook-free parent produces a hook-free child.
+        let plain = sub_policy_of(&root_policy());
+        assert!(plain.tool_defs.is_none() && plain.dispatch.is_none());
     }
 
     #[test]
