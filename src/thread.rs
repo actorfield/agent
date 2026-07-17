@@ -77,8 +77,32 @@ pub fn load_thread(paths: &Paths) -> Vec<Value> {
     };
     contents
         .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        // Usage marker lines (see append_usage) are NOT conversation turns —
+        // every caller here feeds the result straight back to the LLM as
+        // message history on resume. A marker has no "role", so it wouldn't
+        // match the shape either provider expects; excluding it here (once,
+        // centrally) means no caller has to remember to filter it out itself.
+        .filter(|v| v.get("kind").and_then(|k| k.as_str()) != Some("usage"))
         .collect()
+}
+
+/// Append a token-usage marker as its own thread.jsonl line — NOT part of
+/// the conversation `messages` array, so it's never sent back to the LLM.
+/// Distinguished from a real turn by `"kind":"usage"` (real turns have a
+/// "role" instead); load_thread filters these out before reconstructing
+/// history. The frontend reads them directly from the same file to show a
+/// context-usage indicator.
+pub fn append_usage(paths: &Paths, input_tokens: u64, output_tokens: u64) {
+    use serde_json::json;
+    append_thread(
+        paths,
+        &[json!({
+            "kind": "usage",
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        })],
+    );
 }
 
 pub fn append_thread(paths: &Paths, new_messages: &[Value]) {
@@ -133,6 +157,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::for_root_under(dir.path().to_path_buf());
         assert!(load_thread(&paths).is_empty());
+    }
+
+    #[test]
+    fn usage_marker_is_excluded_from_load_thread() {
+        // The bug this guards against: load_thread's result is fed straight
+        // back to the LLM as conversation history on resume. A usage marker
+        // has no "role" field, so if it weren't filtered here it would
+        // reach the API as a malformed message on the next turn.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        append_thread(&paths, &[json!({"role": "user", "content": "hi"})]);
+        append_usage(&paths, 100, 20);
+        append_thread(&paths, &[json!({"role": "assistant", "content": "hey"})]);
+        let loaded = load_thread(&paths);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|m| m.get("kind").is_none()));
+    }
+
+    #[test]
+    fn append_usage_writes_a_kind_usage_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        append_usage(&paths, 42, 7);
+        let contents = std::fs::read_to_string(paths.thread_path()).unwrap();
+        let line: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(line["kind"], "usage");
+        assert_eq!(line["input_tokens"], 42);
+        assert_eq!(line["output_tokens"], 7);
     }
 
     #[test]

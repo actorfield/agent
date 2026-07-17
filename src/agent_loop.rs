@@ -208,6 +208,11 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         if !parsed.text_parts.is_empty() {
             last_text = parsed.text_parts.join("\n");
         }
+        if thread_id.is_some() {
+            if let Some(u) = &parsed.usage {
+                thread::append_usage(&ctx.paths, u.input_tokens, u.output_tokens);
+            }
+        }
         messages.as_array_mut().unwrap().push(parsed.assistant_msg);
 
         let had_tool_calls = !parsed.tool_calls.is_empty();
