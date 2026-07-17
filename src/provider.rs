@@ -16,6 +16,17 @@ pub struct ParsedResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Raw assistant message to push into history (provider-shaped).
     pub assistant_msg: Value,
+    /// Token usage for this call, if the API reported it. Anthropic and
+    /// OpenAI-compatible APIs both return a top-level `usage` object on
+    /// every response (not just the final turn) — normalized here into one
+    /// neutral shape since the two providers use different field names
+    /// (input_tokens/output_tokens vs. prompt_tokens/completion_tokens).
+    pub usage: Option<Usage>,
+}
+
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 pub struct ToolCall {
@@ -168,10 +179,16 @@ impl Provider for Anthropic {
             }
         }
 
+        let usage = (!resp["usage"].is_null()).then(|| Usage {
+            input_tokens: resp["usage"]["input_tokens"].as_u64().unwrap_or(0),
+            output_tokens: resp["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        });
+
         Ok(ParsedResponse {
             text_parts,
             tool_calls,
             assistant_msg: json!({ "role": "assistant", "content": content }),
+            usage,
         })
     }
 
@@ -307,10 +324,16 @@ impl Provider for OpenAI {
             assistant_msg["reasoning_content"] = msg["reasoning_content"].clone();
         }
 
+        let usage = (!resp["usage"].is_null()).then(|| Usage {
+            input_tokens: resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+            output_tokens: resp["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+        });
+
         Ok(ParsedResponse {
             text_parts,
             tool_calls,
             assistant_msg,
+            usage,
         })
     }
 
@@ -500,6 +523,25 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_parses_usage() {
+        let resp = json!({
+            "content": [{"type":"text","text":"hi"}],
+            "usage": {"input_tokens": 123, "output_tokens": 45}
+        });
+        let parsed = Anthropic.parse_response(resp).unwrap();
+        let usage = parsed.usage.expect("usage should be present");
+        assert_eq!(usage.input_tokens, 123);
+        assert_eq!(usage.output_tokens, 45);
+    }
+
+    #[test]
+    fn anthropic_usage_absent_when_response_has_none() {
+        let resp = json!({"content": [{"type":"text","text":"hi"}]});
+        let parsed = Anthropic.parse_response(resp).unwrap();
+        assert!(parsed.usage.is_none());
+    }
+
+    #[test]
     fn openai_parses_tool_calls_from_arguments_string() {
         let resp = json!({"choices":[{"message":{
             "content": "",
@@ -508,6 +550,25 @@ mod tests {
         let parsed = OpenAI.parse_response(resp).unwrap();
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].input["command"], "ls");
+    }
+
+    #[test]
+    fn openai_parses_usage() {
+        let resp = json!({
+            "choices":[{"message":{"content":"hi"}}],
+            "usage": {"prompt_tokens": 200, "completion_tokens": 30, "total_tokens": 230}
+        });
+        let parsed = OpenAI.parse_response(resp).unwrap();
+        let usage = parsed.usage.expect("usage should be present");
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.output_tokens, 30);
+    }
+
+    #[test]
+    fn openai_usage_absent_when_response_has_none() {
+        let resp = json!({"choices":[{"message":{"content":"hi"}}]});
+        let parsed = OpenAI.parse_response(resp).unwrap();
+        assert!(parsed.usage.is_none());
     }
 
     #[test]
