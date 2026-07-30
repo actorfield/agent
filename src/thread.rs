@@ -78,12 +78,18 @@ pub fn load_thread(paths: &Paths) -> Vec<Value> {
     contents
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        // Usage marker lines (see append_usage) are NOT conversation turns —
-        // every caller here feeds the result straight back to the LLM as
-        // message history on resume. A marker has no "role", so it wouldn't
+        // Marker lines (see append_usage, append_ending) are NOT conversation
+        // turns — every caller here feeds the result straight back to the LLM
+        // as message history on resume. A marker has no "role", so it wouldn't
         // match the shape either provider expects; excluding it here (once,
         // centrally) means no caller has to remember to filter it out itself.
-        .filter(|v| v.get("kind").and_then(|k| k.as_str()) != Some("usage"))
+        //
+        // Keyed on the ABSENCE of "role" rather than on a list of known kinds.
+        // Matching `kind == "usage"` meant every marker kind added later
+        // silently leaked into history, shaped like nothing the provider
+        // accepts, and the first symptom would be a malformed-request error on
+        // resume rather than anything pointing here.
+        .filter(|v| v.get("role").is_some())
         .collect()
 }
 
@@ -101,6 +107,30 @@ pub fn append_usage(paths: &Paths, input_tokens: u64, output_tokens: u64) {
             "kind": "usage",
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+        })],
+    );
+}
+
+/// Append an end-of-run marker as its own thread.jsonl line, same convention
+/// as `append_usage`: no "role", so `load_thread` never feeds it back to the
+/// LLM, and the frontend can read it straight from the file.
+///
+/// Exists because a run that stops early is otherwise indistinguishable from
+/// one that finished. `Ending::IterExhausted` is already classified inside
+/// the loop and then discarded at the edge, so the caller prints a partial
+/// answer exactly like a complete one -- the user sees a confident-looking
+/// reply with no hint that the agent simply ran out of turns mid-task, and no
+/// way to ask it to continue.
+pub fn append_ending(paths: &Paths, status: &str, reason: Option<&str>, iter: usize, max_iter: usize) {
+    use serde_json::json;
+    append_thread(
+        paths,
+        &[json!({
+            "kind": "ending",
+            "status": status,
+            "reason": reason,
+            "iter": iter,
+            "max_iter": max_iter,
         })],
     );
 }
@@ -145,11 +175,28 @@ mod tests {
     fn append_is_incremental() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::for_root_under(dir.path().to_path_buf());
-        append_thread(&paths, &[json!({"n":1})]);
-        append_thread(&paths, &[json!({"n":2})]);
+        // Real turns, not bare objects: load_thread returns conversation
+        // history and now filters on the presence of "role", so a role-less
+        // object is a marker by definition and is excluded.
+        append_thread(&paths, &[json!({"role":"user","n":1})]);
+        append_thread(&paths, &[json!({"role":"assistant","n":2})]);
         let loaded = load_thread(&paths);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[1]["n"], 2);
+    }
+
+    /// Markers must never reach the LLM: load_thread reconstructs message
+    /// history, and a role-less line matches no shape either provider accepts.
+    #[test]
+    fn markers_are_excluded_from_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        append_thread(&paths, &[json!({"role":"user","content":"a"})]);
+        append_usage(&paths, 10, 20);
+        append_ending(&paths, "partial", Some("iter_exhausted"), 50, 50);
+        let loaded = load_thread(&paths);
+        assert_eq!(loaded.len(), 1, "only the real turn survives");
+        assert_eq!(loaded[0]["role"], "user");
     }
 
     #[test]
