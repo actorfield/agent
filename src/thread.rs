@@ -121,12 +121,39 @@ pub fn append_usage(paths: &Paths, input_tokens: u64, output_tokens: u64) {
 /// answer exactly like a complete one -- the user sees a confident-looking
 /// reply with no hint that the agent simply ran out of turns mid-task, and no
 /// way to ask it to continue.
+/// Coarse disposition of a run: the single dimension a reader switches on.
+///
+/// `status` grew ad hoc into success/partial/interrupted/cancelled while
+/// `reason` separately carried iter_exhausted/pod_restart -- the same concept
+/// split across two fields, with no way at all to say "paused". Consumers had
+/// to infer that from a combination, and each inferred it slightly differently.
+///
+/// Three values, because there are three things a reader does about a run:
+/// nothing (done), answer or continue it (paused), investigate (failed).
+/// Waiting for a person, hitting the turn cap and being cancelled are all
+/// PAUSED -- none is a fault, and colouring them like failures trains people
+/// to ignore failures.
+///
+/// `status` is still written alongside for the older consumers; `outcome` is
+/// additive and authoritative.
+pub fn outcome_for(status: &str, reason: Option<&str>) -> &'static str {
+    match (status, reason) {
+        ("success", _) => "done",
+        // Ceilings, not faults: the work stands and the user can act on it.
+        (_, Some("context_exhausted")) => "paused",
+        ("partial", _) | ("blocked", Some("awaiting_input")) | ("cancelled", _) => "paused",
+        (_, Some("awaiting_input")) => "paused",
+        _ => "failed",
+    }
+}
+
 pub fn append_ending(paths: &Paths, status: &str, reason: Option<&str>, iter: usize, max_iter: usize) {
     use serde_json::json;
     append_thread(
         paths,
         &[json!({
             "kind": "ending",
+            "outcome": outcome_for(status, reason),
             "status": status,
             "reason": reason,
             "iter": iter,
@@ -220,6 +247,46 @@ mod tests {
         let loaded = load_thread(&paths);
         assert_eq!(loaded.len(), 2);
         assert!(loaded.iter().all(|m| m.get("kind").is_none()));
+    }
+
+    #[test]
+    fn outcome_collapses_status_and_reason_to_one_dimension() {
+        // The three things a reader does about a run: nothing, continue it,
+        // investigate it.
+        assert_eq!(outcome_for("success", None), "done");
+        assert_eq!(outcome_for("partial", Some("iter_exhausted")), "paused");
+        assert_eq!(outcome_for("blocked", Some("awaiting_input")), "paused");
+        assert_eq!(outcome_for("cancelled", None), "paused");
+        assert_eq!(outcome_for("failure", Some("llm_error")), "failed");
+        assert_eq!(outcome_for("interrupted", Some("pod_restart")), "failed");
+    }
+
+    #[test]
+    fn awaiting_input_is_paused_whatever_status_it_arrives_with() {
+        // The HITL terminus classifies to Blocked today, but that mapping is
+        // policy-owned and injectable. The reason is the durable signal, so a
+        // policy change must not silently turn "waiting for you" into a
+        // failure the user is never asked to answer.
+        for st in ["blocked", "partial", "failure", "weird"] {
+            assert_eq!(outcome_for(st, Some("awaiting_input")), "paused", "status {st}");
+        }
+    }
+
+    #[test]
+    fn context_exhaustion_is_paused_not_failed() {
+        // Nothing is broken and retrying the same thread cannot help, but a
+        // fresh or compacted one can -- that is a pause with an action, not a
+        // failure to investigate.
+        assert_eq!(outcome_for("partial", Some("context_exhausted")), "paused");
+        assert_eq!(outcome_for("failure", Some("context_exhausted")), "paused");
+    }
+
+    #[test]
+    fn an_unknown_status_reads_as_failed_not_done() {
+        // Fail safe: a status this function has never heard of must never be
+        // reported as a clean finish.
+        assert_eq!(outcome_for("bananas", None), "failed");
+        assert_eq!(outcome_for("", None), "failed");
     }
 
     #[test]

@@ -17,6 +17,29 @@ pub fn llm_url() -> String {
     std::env::var("LLM_URL").unwrap_or_else(|_| DEFAULT_LLM_URL.to_string())
 }
 
+/// True when an LLM error is the context window overflowing, rather than a
+/// transport or auth fault.
+///
+/// Matched on the message because providers disagree on how they say it and
+/// none of them gives a machine-readable code every time: Anthropic sends
+/// "prompt is too long", OpenAI "maximum context length"/"context_length_
+/// exceeded", others "too many tokens". A miss just means the run reports a
+/// generic failure -- the status quo -- so this errs towards not matching
+/// rather than mislabelling an unrelated error as a context overflow.
+pub fn is_context_limit_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "context length",
+        "context_length_exceeded",
+        "maximum context",
+        "prompt is too long",
+        "too many tokens",
+        "reduce the length",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
+}
+
 pub fn llm_model() -> String {
     std::env::var("LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
 }
@@ -233,5 +256,45 @@ mod tests {
     fn clip_bounds_body_length() {
         let long = "x".repeat(1000);
         assert_eq!(clip(&long).len(), 300);
+    }
+}
+
+#[cfg(test)]
+mod context_limit_tests {
+    use super::is_context_limit_error;
+
+    #[test]
+    fn recognises_each_provider_wording() {
+        // No provider gives a reliable machine-readable code, so this matches
+        // on the message. These are the actual phrasings seen in the wild.
+        for m in [
+            "prompt is too long: 210000 tokens > 200000 maximum",
+            "This model's maximum context length is 128000 tokens",
+            "context_length_exceeded",
+            "Please reduce the length of the messages",
+            "too many tokens in request",
+        ] {
+            assert!(is_context_limit_error(m), "missed: {m}");
+        }
+    }
+
+    #[test]
+    fn does_not_claim_unrelated_errors() {
+        // A miss costs a generic failure label (the status quo); a false match
+        // would tell the user to shorten a conversation over an auth problem.
+        for m in [
+            "connection reset by peer",
+            "401 Unauthorized: invalid api key",
+            "429 rate limit exceeded",
+            "upstream timed out",
+            "",
+        ] {
+            assert!(!is_context_limit_error(m), "false positive: {m}");
+        }
+    }
+
+    #[test]
+    fn is_case_insensitive() {
+        assert!(is_context_limit_error("PROMPT IS TOO LONG"));
     }
 }

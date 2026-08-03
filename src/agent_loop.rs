@@ -193,7 +193,15 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[agent {label}] llm error: {e}");
-                ending = Ending::Failed;
+                // A context overflow is a ceiling, not a fault: retrying the
+                // same thread cannot help, but a fresh or compacted one can.
+                // Reported as a generic failure it reads as a bug and the one
+                // action that helps goes unsuggested.
+                ending = if crate::llm::is_context_limit_error(&e.to_string()) {
+                    Ending::ContextExhausted
+                } else {
+                    Ending::Failed
+                };
                 break;
             }
         };

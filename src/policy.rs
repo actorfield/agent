@@ -36,6 +36,13 @@ pub enum Ending {
     Blocked,
     /// Cancelled by external signal (cancel file).
     Cancelled,
+    /// The conversation outgrew the model's context window.
+    ///
+    /// Distinct from Failed: nothing is broken and nothing will be fixed by
+    /// retrying the same thread -- the run needs a fresh thread or a compacted
+    /// history. Reported as a generic failure it reads as a bug, and the one
+    /// action that actually helps is not suggested.
+    ContextExhausted,
     /// The model asked the user a question and is waiting for the answer.
     ///
     /// A terminus, not a failure: the run stopped because it needs a human,
@@ -92,6 +99,10 @@ fn default_classify(end: Ending, _p: &Progress) -> (Status, Option<FailureKind>)
         // the run, it is suspended pending an answer. AmbiguousRequest is the
         // existing kind that means exactly "needs the user to disambiguate".
         Ending::AwaitingInput => (Status::Blocked, Some(FailureKind::AmbiguousRequest)),
+        // Partial, like the other ceilings: the work done so far stands, and
+        // the run stopped because it hit a limit rather than because anything
+        // went wrong.
+        Ending::ContextExhausted => (Status::Partial, Some(FailureKind::BudgetExceeded)),
     }
 }
 
