@@ -115,6 +115,14 @@ pub fn is_builtin(name: &str) -> bool {
 /// resumes the thread as an ordinary turn.
 pub const ASK_USER: &str = "ask_user";
 
+/// Result given to tools the model batched alongside `ask_user`. They are
+/// skipped on purpose -- see the interception in `agent_loop` -- and the model
+/// has to be told, or it resumes assuming their side effects happened.
+pub const NOT_RUN_WHILE_ASKING: &str =
+    "[not run: this call was issued alongside ask_user, and the run paused to \
+     put the question to the person. Nothing was executed. Reissue it if you \
+     still need it now that you have their answer.]";
+
 /// The question text from an ask_user call, if it carries one.
 pub fn ask_user_question(input: &Value) -> Option<String> {
     input

@@ -56,6 +56,14 @@ pub trait Provider: Send + Sync {
     fn tool_call_message(&self, id: &str, name: &str, input: &Value) -> Value;
     /// True iff `messages` already contains a tool result answering `tool_use_id`.
     fn has_tool_result(&self, messages: &Value, tool_use_id: &str) -> bool;
+    /// Tool calls issued by the FINAL assistant message that no tool result
+    /// answers, as (id, name) in the order the model issued them.
+    ///
+    /// This is how a run that stopped mid-round is detected on resume. Both
+    /// providers reject a conversation containing a tool call with no result,
+    /// so a paused `ask_user` -- which deliberately breaks the loop before any
+    /// tool runs -- leaves history that cannot be sent back as-is.
+    fn pending_tool_calls(&self, messages: &Value) -> Vec<(String, String)>;
 }
 
 /// Pick a provider from the endpoint URL.
@@ -240,6 +248,28 @@ impl Provider for Anthropic {
             })
         })
     }
+
+    fn pending_tool_calls(&self, messages: &Value) -> Vec<(String, String)> {
+        let Some(last) = messages.as_array().and_then(|m| m.last()) else {
+            return vec![];
+        };
+        if last["role"] != "assistant" {
+            return vec![];
+        }
+        last["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b["type"] == "tool_use")
+                    .filter_map(|b| {
+                        Some((b["id"].as_str()?.to_string(), b["name"].as_str()?.to_string()))
+                    })
+                    .filter(|(id, _)| !self.has_tool_result(messages, id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 // ── OpenAI-compatible ───────────────────────────────────────────────────────────
@@ -379,6 +409,30 @@ impl Provider for OpenAI {
             msgs.iter()
                 .any(|m| m["role"] == "tool" && m["tool_call_id"] == tool_use_id)
         })
+    }
+
+    fn pending_tool_calls(&self, messages: &Value) -> Vec<(String, String)> {
+        let Some(last) = messages.as_array().and_then(|m| m.last()) else {
+            return vec![];
+        };
+        if last["role"] != "assistant" {
+            return vec![];
+        }
+        last["tool_calls"]
+            .as_array()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|c| {
+                        Some((
+                            c["id"].as_str()?.to_string(),
+                            c["function"]["name"].as_str()?.to_string(),
+                        ))
+                    })
+                    .filter(|(id, _)| !self.has_tool_result(messages, id))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 

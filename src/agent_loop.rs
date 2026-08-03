@@ -101,17 +101,6 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
     // spill directory this way, since sub-agents are recursive in-process calls
     // (not new OS processes), so a single env var can't hold a distinct value
     // per sub-agent the way it could for the top-level run alone.
-    let task_text = format!(
-        "[run started: {}]\nYour run directory: {}\n{}",
-        now(),
-        ctx.paths.dir().display(),
-        render_task(&job)
-    );
-    let task_msg = json!({
-        "role": "user",
-        "content": [{"type": "text", "text": task_text, "cache_control": {"type": "ephemeral"}}]
-    });
-
     // Load prior conversation (and, at the top level, resume any durable work that
     // was in flight when a previous process died).
     let mut history: Vec<Value> = match &thread_id {
@@ -130,9 +119,79 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         }
         None => vec![],
     };
-    history.push(task_msg);
+    // Everything loaded is already on disk; everything appended below is not.
+    // Taken before the repair so the synthesized tool results get persisted
+    // too -- if they were treated as already-saved, the next resume would load
+    // the same dangling call again and fail the same way.
+    let persisted_base = history.len();
+
+    // Close out a round the previous run stopped in the middle of.
+    //
+    // `ask_user` breaks the loop BEFORE running any tool, so the assistant turn
+    // it stopped on is persisted with tool calls and no results -- and BOTH
+    // providers reject a conversation in that shape. Without this, every answer
+    // to a question would fail the request outright: the feature would look
+    // fine right up to the moment someone replied.
+    //
+    // Anything the model batched alongside the question is answered too. Those
+    // tools deliberately did not run, and saying so is what stops the model
+    // from carrying on as though they had.
+    let pending = ctx.provider.pending_tool_calls(&json!(&history[..]));
+    let answered_question = pending
+        .iter()
+        .any(|(_, name)| name == crate::tools::ASK_USER);
+    let task_text = if answered_question {
+        // The answer itself rides in the tool result below, where the model
+        // expects a reply to its question -- repeating it here would read as
+        // being asked and answered twice.
+        format!(
+            "[run resumed: {}]\nYour run directory: {}",
+            now(),
+            ctx.paths.dir().display()
+        )
+    } else {
+        format!(
+            "[run started: {}]\nYour run directory: {}\n{}",
+            now(),
+            ctx.paths.dir().display(),
+            render_task(&job)
+        )
+    };
+    let text_block =
+        json!({"type": "text", "text": task_text, "cache_control": {"type": "ephemeral"}});
+
+    if pending.is_empty() {
+        history.push(json!({ "role": "user", "content": [text_block] }));
+    } else {
+        let results: Vec<ToolResult> = pending
+            .iter()
+            .map(|(id, name)| ToolResult {
+                tool_use_id: id.clone(),
+                content: if name == crate::tools::ASK_USER {
+                    render_task(&job)
+                } else {
+                    tools::NOT_RUN_WHILE_ASKING.to_string()
+                },
+            })
+            .collect();
+        let mut tool_msgs = ctx.provider.wrap_tool_results(results);
+        // Anthropic returns the results as a single `user` message. Appending
+        // the framing as a second `user` message would put two of them back to
+        // back, so it folds into the same one. OpenAI returns `tool` messages,
+        // which a following `user` message is the correct shape for.
+        let fold = tool_msgs.last().is_some_and(|m| m["role"] == "user");
+        if fold {
+            if let Some(content) = tool_msgs.last_mut().unwrap()["content"].as_array_mut() {
+                content.push(text_block);
+            }
+            history.extend(tool_msgs);
+        } else {
+            history.extend(tool_msgs);
+            history.push(json!({ "role": "user", "content": [text_block] }));
+        }
+    }
     let mut messages = json!(history);
-    let mut persisted_len = messages.as_array().unwrap().len() - 1;
+    let mut persisted_len = persisted_base;
 
     // Tool set: the policy may swap the builtin definitions for its own;
     // spawn_agent is appended by the loop either way (delegation is loop
@@ -597,7 +656,7 @@ mod tests {
     use super::*;
     use crate::job::Persistence;
     use crate::policy::{root_policy, sub_policy};
-    use crate::provider::Anthropic;
+    use crate::provider::{Anthropic, OpenAI};
     use std::sync::Mutex;
 
     /// A scripted client: returns queued responses in order. `Mutex`, not
@@ -748,6 +807,323 @@ mod tests {
         assert_eq!(r.ending, Some(Ending::AwaitingInput));
         assert!(!marker.exists(), "batched tool ran despite ask_user");
         assert_eq!(r.steps_taken, 0, "asking is not a step");
+    }
+
+    /// Records the conversation as sent, so a test can assert on the request the
+    /// API would really have received rather than on the saved transcript.
+    struct RecordingClient {
+        responses: Mutex<Vec<Value>>,
+        seen: Mutex<Vec<Value>>,
+    }
+    impl RecordingClient {
+        fn new(responses: Vec<Value>) -> RecordingClient {
+            RecordingClient {
+                responses: Mutex::new(responses),
+                seen: Mutex::new(vec![]),
+            }
+        }
+        fn first_request(&self) -> Value {
+            self.seen
+                .lock()
+                .unwrap()
+                .first()
+                .cloned()
+                .expect("no request was made")
+        }
+    }
+    impl LlmClient for RecordingClient {
+        fn call(
+            &self,
+            _p: &dyn Provider,
+            _m: &str,
+            msgs: &mut Value,
+            _s: &str,
+            _t: &Value,
+            _effort: Effort,
+        ) -> Result<Value, String> {
+            self.seen.lock().unwrap().push(msgs.clone());
+            let mut q = self.responses.lock().unwrap();
+            if q.is_empty() {
+                Err("no scripted response".into())
+            } else {
+                Ok(q.remove(0))
+            }
+        }
+    }
+
+    /// Every tool call in `msgs` that no result answers. This is the invariant
+    /// both providers enforce, and the one a paused question breaks.
+    fn dangling_calls(p: &dyn Provider, msgs: &Value) -> Vec<String> {
+        msgs.as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .filter_map(|m| m["content"].as_array())
+            .flatten()
+            .filter(|b| b["type"] == "tool_use")
+            .filter_map(|b| b["id"].as_str())
+            .filter(|id| !p.has_tool_result(msgs, id))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn resume(paths: &Paths, client: &dyn LlmClient, provider: &dyn Provider, answer: &str) {
+        let c = ctx(client, provider, paths.clone(), 100);
+        let _ = run(
+            &c,
+            RunConfig {
+                job: Job::new(answer.into(), vec![], Persistence::Ephemeral, 5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: Some("t".to_string()),
+            },
+        );
+    }
+
+    fn pause_on_question(paths: &Paths, provider: &dyn Provider, turn: Value) {
+        let client = ScriptedClient::new(vec![turn]);
+        let c = ctx(&client, provider, paths.clone(), 100);
+        let r = run(
+            &c,
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: Some("t".to_string()),
+            },
+        );
+        assert_eq!(r.ending, Some(Ending::AwaitingInput));
+    }
+
+    /// Answering a question must produce a conversation the API will accept.
+    ///
+    /// The pause persists an assistant turn whose tool call has no result, and
+    /// both providers reject that outright — so without the repair the FIRST
+    /// reply to any question fails the request. The feature looks fine until
+    /// someone actually answers.
+    #[test]
+    fn answering_a_question_sends_no_dangling_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let provider = Anthropic;
+
+        pause_on_question(&paths, &provider, ask_turn("t1", "Which bucket?"));
+
+        // The pause really does leave a dangling call on disk. Without this the
+        // test could pass while exercising nothing.
+        let saved = json!(thread::load_thread(&paths));
+        assert_eq!(
+            dangling_calls(&provider, &saved),
+            vec!["t1".to_string()],
+            "expected the paused question to be left unanswered on disk"
+        );
+
+        let client = RecordingClient::new(vec![text_turn("done")]);
+        resume(&paths, &client, &provider, "the prod bucket");
+
+        let sent = client.first_request();
+        assert!(
+            dangling_calls(&provider, &sent).is_empty(),
+            "sent a tool call with no result: {sent}"
+        );
+        let answer = sent.to_string();
+        assert!(
+            answer.contains("the prod bucket"),
+            "the person's answer never reached the model: {sent}"
+        );
+    }
+
+    /// Anthropic returns tool results as a `user` message, and the run framing
+    /// is also a `user` message. Emitted separately they would be two user
+    /// turns back to back, which the API rejects for a different reason than
+    /// the one this repair exists to fix.
+    #[test]
+    fn answering_a_question_does_not_emit_two_user_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let provider = Anthropic;
+
+        pause_on_question(&paths, &provider, ask_turn("t1", "Which bucket?"));
+        let client = RecordingClient::new(vec![text_turn("done")]);
+        resume(&paths, &client, &provider, "prod");
+
+        let sent = client.first_request();
+        let roles: Vec<&str> = sent
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            !roles.windows(2).any(|w| w[0] == "user" && w[1] == "user"),
+            "consecutive user turns: {roles:?}"
+        );
+    }
+
+    /// A tool the model batched alongside the question never ran. On resume it
+    /// still needs a result, and that result has to SAY it did not run —
+    /// otherwise the model carries on as though the side effect happened.
+    #[test]
+    fn tools_batched_with_a_question_resume_as_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let provider = Anthropic;
+
+        pause_on_question(
+            &paths,
+            &provider,
+            json!({"content":[
+                {"type":"tool_use","id":"t1","name":"ask_user","input":{"question":"which?"}},
+                {"type":"tool_use","id":"t2","name":"run_shell","input":{"command":"rm -rf /data"}}
+            ]}),
+        );
+
+        let client = RecordingClient::new(vec![text_turn("done")]);
+        resume(&paths, &client, &provider, "prod");
+
+        let sent = client.first_request();
+        assert!(
+            dangling_calls(&provider, &sent).is_empty(),
+            "batched call left unanswered: {sent}"
+        );
+        assert!(
+            provider.has_tool_result(&sent, "t2"),
+            "the batched shell call got no result: {sent}"
+        );
+        assert!(
+            sent.to_string().contains("not run"),
+            "the batched call was not reported as skipped: {sent}"
+        );
+    }
+
+    /// The repair must survive being resumed twice. The synthesized results are
+    /// only correct if they were persisted; if they were treated as already on
+    /// disk, the next resume would reload the same dangling call and fail the
+    /// same way.
+    #[test]
+    fn a_repaired_question_stays_repaired_on_the_next_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let provider = Anthropic;
+
+        pause_on_question(&paths, &provider, ask_turn("t1", "Which bucket?"));
+        let first = RecordingClient::new(vec![text_turn("done")]);
+        resume(&paths, &first, &provider, "prod");
+
+        let second = RecordingClient::new(vec![text_turn("done again")]);
+        resume(&paths, &second, &provider, "and now deploy");
+
+        let sent = second.first_request();
+        assert!(
+            dangling_calls(&provider, &sent).is_empty(),
+            "the repair did not persist: {sent}"
+        );
+    }
+
+    /// The same repair over the OpenAI wire shape, which is what production
+    /// actually runs. Its tool calls live in a `tool_calls` array rather than
+    /// content blocks, and its results are separate `tool` messages, so the
+    /// Anthropic tests above prove nothing about it.
+    ///
+    /// The paused turn is copied from a real thread on the cluster: an
+    /// assistant message with `tool_calls` and no `tool` reply after it.
+    #[test]
+    fn openai_answering_a_question_sends_no_dangling_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let provider = OpenAI;
+
+        let ask = json!({"choices":[{"message":{
+            "role": "assistant",
+            "content": "Let me demonstrate it right now:",
+            "tool_calls": [{
+                "id": "call_00_dNwvS4CQ",
+                "index": 0,
+                "type": "function",
+                "function": {
+                    "name": "ask_user",
+                    "arguments": "{\"question\": \"HITL test — does this reach you?\"}"
+                }
+            }]
+        }}]});
+
+        let client = ScriptedClient::new(vec![ask]);
+        let c = ctx(&client, &provider, paths.clone(), 100);
+        let r = run(
+            &c,
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: Some("t".to_string()),
+            },
+        );
+        assert_eq!(r.ending, Some(Ending::AwaitingInput));
+
+        // The dangling call is real on disk in the OpenAI shape too.
+        let saved = json!(thread::load_thread(&paths));
+        assert!(
+            !provider.pending_tool_calls(&saved).is_empty(),
+            "expected an unanswered tool_call: {saved}"
+        );
+
+        let client = RecordingClient::new(vec![
+            json!({"choices":[{"message":{"role":"assistant","content":"ok"}}]}),
+        ]);
+        resume(&paths, &client, &provider, "yes it reached me");
+
+        let sent = client.first_request();
+        // OpenAI answers with `tool` messages, so the Anthropic-shaped
+        // dangling_calls helper does not apply -- check the id directly.
+        assert!(
+            provider.has_tool_result(&sent, "call_00_dNwvS4CQ"),
+            "the question was never answered: {sent}"
+        );
+        assert!(
+            provider.pending_tool_calls(&sent).is_empty(),
+            "still ends on an unanswered call: {sent}"
+        );
+        assert!(
+            sent.to_string().contains("yes it reached me"),
+            "the person's answer never reached the model: {sent}"
+        );
+    }
+
+    /// An ordinary resume — no question pending — must be untouched.
+    #[test]
+    fn an_ordinary_resume_still_carries_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let provider = Anthropic;
+
+        let first = ScriptedClient::new(vec![text_turn("hello")]);
+        let c = ctx(&first, &provider, paths.clone(), 100);
+        let _ = run(
+            &c,
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: Some("t".to_string()),
+            },
+        );
+
+        let client = RecordingClient::new(vec![text_turn("ok")]);
+        resume(&paths, &client, &provider, "next thing please");
+
+        let sent = client.first_request().to_string();
+        assert!(
+            sent.contains("next thing please"),
+            "the new task never reached the model"
+        );
+        assert!(
+            sent.contains("run started"),
+            "a resume with no pending question should still frame as a start"
+        );
     }
 
     #[test]
