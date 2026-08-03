@@ -21,6 +21,25 @@ pub fn base_tool_defs(depth: usize) -> Value {
             }
         }),
         json!({
+            "name": "ask_user",
+            "description": "Ask the person you are working for a question, and STOP until they \
+answer. Use this when the task is genuinely ambiguous, when a choice would be expensive or \
+irreversible to get wrong, or when you are missing information only they have. Prefer this over \
+guessing and continuing: a wrong assumption carried through a long run costs far more than one \
+question. Do not use it for things you can determine yourself by looking.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "What you need to know. Be specific, and say what you \
+will do with each possible answer."
+                    }
+                },
+                "required": ["question"]
+            }
+        }),
+        json!({
             "name": "read_image",
             "description": "Read a JPEG or PNG image and extract information using vision AI. \
 Processes the entire image in a single API call — ask for everything needed in one question.",
@@ -83,7 +102,27 @@ focused subtasks whose intermediate steps you do not need to keep in your own co
 
 /// True iff a tool name is one the loop dispatches directly (not delegation).
 pub fn is_builtin(name: &str) -> bool {
-    matches!(name, "run_shell" | "read_image" | "read_pdf")
+    matches!(name, "run_shell" | "read_image" | "read_pdf" | ASK_USER)
+}
+
+/// The one tool the loop does not execute: calling it ENDS the run.
+///
+/// It has no implementation on purpose. Every other tool returns a result and
+/// the loop continues; this one has no answer available in-process, because the
+/// answer is a person's next message. The loop intercepts the call, takes the
+/// question as the run's output and stops with Ending::AwaitingInput -- so the
+/// question reaches the user through the normal reply path, and their response
+/// resumes the thread as an ordinary turn.
+pub const ASK_USER: &str = "ask_user";
+
+/// The question text from an ask_user call, if it carries one.
+pub fn ask_user_question(input: &Value) -> Option<String> {
+    input
+        .get("question")
+        .and_then(|q| q.as_str())
+        .map(|q| q.trim())
+        .filter(|q| !q.is_empty())
+        .map(|q| q.to_string())
 }
 
 // ── Implementations ─────────────────────────────────────────────────────────────

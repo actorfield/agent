@@ -225,6 +225,29 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
             break;
         }
 
+        // ask_user is a terminus, not a tool call: there is no result to feed
+        // back, because the answer is the user's next message. Intercepted
+        // BEFORE any tool runs so a turn that asks a question does not also
+        // execute whatever else the model batched alongside it -- those side
+        // effects would land while the run was supposedly waiting, and the
+        // user would be answering a question about work that had already
+        // moved on.
+        if let Some(tc) = parsed
+            .tool_calls
+            .iter()
+            .find(|tc| tc.name == crate::tools::ASK_USER)
+        {
+            if let Some(q) = crate::tools::ask_user_question(&tc.input) {
+                last_text = q;
+            }
+            if thread_id.is_some() {
+                let all = messages.as_array().unwrap();
+                thread::append_thread(&ctx.paths, &all[persisted_len..]);
+            }
+            ending = Ending::AwaitingInput;
+            break;
+        }
+
         // spawn_agent calls run concurrently with each other (each gets its own
         // fresh context and budget, and its own nested Paths, so nothing about
         // running them on separate threads is unsafe by construction) — every
@@ -320,6 +343,11 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
 
     let output = match status {
         Status::Success | Status::Partial => Some(last_text),
+        // A run awaiting an answer classifies as Blocked, but unlike a genuine
+        // block its last text IS the payload -- the question the user has to
+        // answer. Dropping it here would stop the run and show the user
+        // nothing to respond to, which is the one outcome HITL must not have.
+        Status::Blocked if ending == Ending::AwaitingInput => Some(last_text),
         Status::Failure | Status::Blocked => None,
     };
     JobResult {
@@ -329,6 +357,7 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         failure,
         steps_taken,
         issues,
+        ending: Some(ending),
     }
 }
 
@@ -625,6 +654,92 @@ mod tests {
 
     fn job(max_iter: usize) -> Job {
         Job::new("do it".into(), vec![], Persistence::Ephemeral, max_iter)
+    }
+
+    fn ask_turn(id: &str, q: &str) -> Value {
+        json!({"content":[{"type":"tool_use","id":id,"name":"ask_user","input":{"question":q}}]})
+    }
+
+    /// ask_user must END the run, not be executed like any other tool.
+    #[test]
+    fn ask_user_stops_the_run_awaiting_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        // A second turn is scripted deliberately: if the loop kept going, it
+        // would consume this and the assertions below would see "kept going"
+        // instead of the question.
+        let client = ScriptedClient::new(vec![
+            ask_turn("t1", "Which bucket should I write to?"),
+            text_turn("kept going"),
+        ]);
+        let provider = Anthropic;
+        let c = ctx(&client, &provider, paths.clone(), 100);
+        let r = run(
+            &c,
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: None,
+            },
+        );
+        assert_eq!(r.ending, Some(Ending::AwaitingInput));
+        assert_eq!(r.status, Status::Blocked);
+    }
+
+    /// The question is the payload. Blocked normally discards output, so this
+    /// is the case that would silently leave the user nothing to answer.
+    #[test]
+    fn ask_user_returns_the_question_as_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let client = ScriptedClient::new(vec![ask_turn("t1", "Prod or staging?")]);
+        let provider = Anthropic;
+        let c = ctx(&client, &provider, paths.clone(), 100);
+        let r = run(
+            &c,
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: None,
+            },
+        );
+        assert_eq!(r.output.as_deref(), Some("Prod or staging?"));
+    }
+
+    /// A turn that asks AND batches other calls must not run them: those side
+    /// effects would land while the run was supposedly waiting, and the user
+    /// would answer a question about work that had already moved on.
+    #[test]
+    fn ask_user_suppresses_tools_batched_in_the_same_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let marker = dir.path().join("side-effect");
+        let both = json!({"content":[
+            {"type":"tool_use","id":"a","name":"run_shell",
+             "input":{"command": format!("touch {}", marker.display())}},
+            {"type":"tool_use","id":"b","name":"ask_user",
+             "input":{"question":"Continue?"}}
+        ]});
+        let client = ScriptedClient::new(vec![both]);
+        let provider = Anthropic;
+        let c = ctx(&client, &provider, paths.clone(), 100);
+        let r = run(
+            &c,
+            RunConfig {
+                job: job(5),
+                policy: root_policy(),
+                depth: 0,
+                label: "d0".to_string(),
+                thread_id: None,
+            },
+        );
+        assert_eq!(r.ending, Some(Ending::AwaitingInput));
+        assert!(!marker.exists(), "batched tool ran despite ask_user");
+        assert_eq!(r.steps_taken, 0, "asking is not a step");
     }
 
     #[test]

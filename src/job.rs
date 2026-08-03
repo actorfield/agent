@@ -140,6 +140,15 @@ pub struct JobResult {
     /// Unsatisfied requirements; empty on success.
     #[serde(default)]
     pub issues: Vec<String>,
+    /// How the run actually concluded.
+    ///
+    /// Status alone loses information the caller needs: IterExhausted and
+    /// Cancelled both classify to (Partial, BudgetExceeded), so "ran out of
+    /// turns" and "the user stopped it" are indistinguishable downstream --
+    /// and a run awaiting an answer has to be told apart from one that simply
+    /// finished. Defaulted so an older serialised result still deserialises.
+    #[serde(default)]
+    pub ending: Option<crate::policy::Ending>,
 }
 
 impl JobResult {
@@ -151,6 +160,7 @@ impl JobResult {
             failure: None,
             steps_taken,
             issues: Vec::new(),
+            ending: None,
         }
     }
 
@@ -162,6 +172,7 @@ impl JobResult {
             failure: Some(failure),
             steps_taken,
             issues: Vec::new(),
+            ending: None,
         }
     }
 
@@ -173,6 +184,7 @@ impl JobResult {
             failure: Some(failure),
             steps_taken,
             issues: Vec::new(),
+            ending: None,
         }
     }
 
@@ -184,6 +196,7 @@ impl JobResult {
             failure: Some(failure),
             steps_taken,
             issues: Vec::new(),
+            ending: None,
         }
     }
 
@@ -265,6 +278,7 @@ mod tests {
             failure: Some(FailureKind::CheckFailed),
             steps_taken: 1,
             issues: vec!["nope".into()],
+            ending: None,
         };
         assert!(!bad.is_consistent());
     }

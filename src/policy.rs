@@ -4,6 +4,7 @@
 //! whether delegation is permitted. A top-level run and a sub-agent run use the
 //! same loop with different bundles.
 
+use serde::{Deserialize, Serialize};
 use crate::job::{FailureKind, Status};
 use crate::provider::ToolCall;
 use serde_json::Value;
@@ -20,7 +21,8 @@ pub struct Progress<'a> {
 
 /// How a run concluded — the loop reports one of these and the policy turns it
 /// into a status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Ending {
     /// Model produced no tool calls: natural completion.
     Stopped,
@@ -34,6 +36,16 @@ pub enum Ending {
     Blocked,
     /// Cancelled by external signal (cancel file).
     Cancelled,
+    /// The model asked the user a question and is waiting for the answer.
+    ///
+    /// A terminus, not a failure: the run stopped because it needs a human,
+    /// which is the correct behaviour when a task is genuinely ambiguous. Kept
+    /// distinct from Blocked (a tool or precondition is missing, which the user
+    /// cannot resolve by replying) and from Stopped (the model believes it is
+    /// finished) so a caller can tell "answer me" from "I'm done" -- they look
+    /// identical in the transcript otherwise, and the run that is waiting is
+    /// the one that must not be reported as complete.
+    AwaitingInput,
 }
 
 /// The injectable control bundle.
@@ -76,6 +88,10 @@ fn default_classify(end: Ending, _p: &Progress) -> (Status, Option<FailureKind>)
         Ending::Failed => (Status::Failure, Some(FailureKind::RetrievalFailed)),
         Ending::Blocked => (Status::Blocked, Some(FailureKind::ToolUnavailable)),
         Ending::Cancelled => (Status::Partial, Some(FailureKind::BudgetExceeded)),
+        // Blocked, not Partial: the work is not incomplete through any fault of
+        // the run, it is suspended pending an answer. AmbiguousRequest is the
+        // existing kind that means exactly "needs the user to disambiguate".
+        Ending::AwaitingInput => (Status::Blocked, Some(FailureKind::AmbiguousRequest)),
     }
 }
 
