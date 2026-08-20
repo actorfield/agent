@@ -163,6 +163,17 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
     if pending.is_empty() {
         history.push(json!({ "role": "user", "content": [text_block] }));
     } else {
+        // Deliberately NOT run through `redact_results`, unlike the other two
+        // ToolResult sites. Both contents here are safe by construction: one is
+        // a compile-time constant, the other is `job.task`, which the caller
+        // redacts once when the Job is built. Sending it through the door again
+        // would re-scan already-redacted text on every resume, against a
+        // detector that serves one request at a time.
+        //
+        // The invariant this rests on: `job.task` is redacted at construction.
+        // If that ever stops being true, this site starts leaking silently, so
+        // it belongs in the same change as any alteration to how the task is
+        // built.
         let results: Vec<ToolResult> = pending
             .iter()
             .map(|(id, name)| ToolResult {
@@ -381,6 +392,7 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
             }
         }
 
+        let results = redact_results(&policy, results, &label);
         for m in ctx.provider.wrap_tool_results(results) {
             messages.as_array_mut().unwrap().push(m);
         }
@@ -426,6 +438,30 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         issues,
         ending: Some(ending),
     }
+}
+
+/// Redact tool output before it becomes part of the conversation.
+///
+/// This is the single door for content the model has never seen. Tool results
+/// and sub-agent results are the only ways such content reaches the message
+/// array, so redacting here cannot be forgotten by a tool added later -- which
+/// is the difference between a guarantee and a convention each new tool has to
+/// remember to keep.
+///
+/// Failure withholds the output rather than passing it through. A caller
+/// cannot distinguish "nothing needed redacting" from "redacting broke", so
+/// failing open would be indistinguishable from working.
+fn redact_results(policy: &Policy, mut results: Vec<ToolResult>, label: &str) -> Vec<ToolResult> {
+    let Some(redact) = policy.redact else {
+        return results;
+    };
+    for r in results.iter_mut() {
+        if let Err(e) = redact(&mut r.content) {
+            eprintln!("[agent {label}] redaction failed, withholding tool result: {e}");
+            r.content = "[redaction error: tool output withheld]".to_string();
+        }
+    }
+    results
 }
 
 /// Check-and-decrement the run's tool-call budget, then dispatch if any remains.
@@ -596,10 +632,17 @@ fn reconcile(ctx: &Ctx, policy: &Policy, parent_tid: &str, history: &mut Vec<Val
         let assistant =
             ctx.provider
                 .tool_call_message(&synth_id, "spawn_agent", &spawn::job_to_input(&job));
-        let tool_msgs = ctx.provider.wrap_tool_results(vec![ToolResult {
-            tool_use_id: synth_id,
-            content: result.to_json(),
-        }]);
+        // The same door as the tool-result path: a sub-agent's output enters
+        // the parent's conversation here and is persisted below, so it cannot
+        // be the one route that skips redaction.
+        let tool_msgs = ctx.provider.wrap_tool_results(redact_results(
+            policy,
+            vec![ToolResult {
+                tool_use_id: synth_id,
+                content: result.to_json(),
+            }],
+            parent_tid,
+        ));
         let mut committed = vec![assistant];
         committed.extend(tool_msgs);
         history.extend(committed.iter().cloned());
@@ -1449,6 +1492,113 @@ mod tests {
             "description": "echo",
             "input_schema": {"type":"object","properties":{},"required":[]}
         }])
+    }
+
+    /// Records the messages array on every call, so a test can see what the
+    /// conversation actually contains after a tool result was pushed.
+    struct MsgRecordingClient {
+        responses: Mutex<Vec<Value>>,
+        last_msgs: Mutex<Option<Value>>,
+    }
+    impl LlmClient for MsgRecordingClient {
+        fn call(
+            &self,
+            _p: &dyn Provider,
+            _m: &str,
+            msgs: &mut Value,
+            _s: &str,
+            _t: &Value,
+            _effort: Effort,
+        ) -> Result<Value, String> {
+            *self.last_msgs.lock().unwrap() = Some(msgs.clone());
+            let mut r = self.responses.lock().unwrap();
+            if r.is_empty() {
+                Ok(json!({"content":[{"type":"text","text":"done"}]}))
+            } else {
+                Ok(r.remove(0))
+            }
+        }
+    }
+
+    fn shell_call_then_stop() -> Vec<Value> {
+        vec![json!({"content":[{
+            "type":"tool_use","id":"t1","name":"run_shell",
+            "input":{"command":"echo hi"}
+        }]})]
+    }
+
+    fn redact_secrets(s: &mut String) -> Result<(), String> {
+        *s = s.replace("SECRET", "[REDACTED]");
+        Ok(())
+    }
+
+    fn leak_secret(_tc: &crate::provider::ToolCall) -> Option<String> {
+        Some("value is SECRET".to_string())
+    }
+
+    #[test]
+    fn tool_results_are_redacted_before_entering_the_conversation() {
+        // The guarantee: a dispatcher that returns sensitive output cannot put
+        // it into the history, because the loop redacts at the door. This is
+        // what makes a tool added later unable to leak by forgetting to mask.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let client = MsgRecordingClient {
+            responses: Mutex::new(shell_call_then_stop()),
+            last_msgs: Mutex::new(None),
+        };
+        let provider = Anthropic;
+        let c = ctx(&client, &provider, paths, 100);
+        let policy = Policy {
+            dispatch: Some(leak_secret),
+            redact: Some(redact_secrets),
+            ..root_policy()
+        };
+        run(&c, RunConfig {
+            job: job(5),
+            policy,
+            depth: 0,
+            label: "d0".to_string(),
+            thread_id: None,
+        });
+        let msgs = client.last_msgs.lock().unwrap().take().unwrap();
+        let dump = serde_json::to_string(&msgs).unwrap();
+        assert!(dump.contains("[REDACTED]"), "redaction did not run: {dump}");
+        assert!(!dump.contains("SECRET"), "raw value reached the conversation: {dump}");
+    }
+
+    #[test]
+    fn a_failing_redactor_withholds_the_tool_result() {
+        // Fail closed. A caller cannot tell "nothing needed redacting" from
+        // "redacting broke", so passing the original through on error would be
+        // indistinguishable from success.
+        fn always_fails(_s: &mut String) -> Result<(), String> {
+            Err("detector unavailable".to_string())
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        let client = MsgRecordingClient {
+            responses: Mutex::new(shell_call_then_stop()),
+            last_msgs: Mutex::new(None),
+        };
+        let provider = Anthropic;
+        let c = ctx(&client, &provider, paths, 100);
+        let policy = Policy {
+            dispatch: Some(leak_secret),
+            redact: Some(always_fails),
+            ..root_policy()
+        };
+        run(&c, RunConfig {
+            job: job(5),
+            policy,
+            depth: 0,
+            label: "d0".to_string(),
+            thread_id: None,
+        });
+        let msgs = client.last_msgs.lock().unwrap().take().unwrap();
+        let dump = serde_json::to_string(&msgs).unwrap();
+        assert!(!dump.contains("SECRET"), "raw value survived a failed redaction: {dump}");
+        assert!(dump.contains("withheld"), "expected a withholding marker: {dump}");
     }
 
     #[test]

@@ -77,6 +77,27 @@ pub struct Policy {
     /// tool output; `None` falls through to the builtin implementations.
     /// `spawn_agent` is never routed here — delegation is loop infrastructure.
     pub dispatch: Option<fn(&ToolCall) -> Option<String>>,
+    /// Optional redaction applied to every tool result BEFORE it enters the
+    /// conversation, and therefore before it is sent, persisted to
+    /// `thread.jsonl`, or synced anywhere.
+    ///
+    /// Takes the raw output string, deliberately -- NOT the wrapped message.
+    /// By the time a result has been through `wrap_tool_results` it carries
+    /// provider-specific structure (Anthropic nests the text under a
+    /// `tool_result` block, OpenAI does not), so a redactor operating there
+    /// would need to know both shapes, and one recursing the whole value would
+    /// rewrite `tool_use_id` and break the conversation. Here it is just text.
+    ///
+    /// This is a door, not a convention: tool results are the only route by
+    /// which content the model has never seen reaches the message array, so a
+    /// hook here cannot be forgotten by a tool added later. A dispatcher arm
+    /// that redacts is a promise each new arm has to remember to keep; this is
+    /// the loop keeping it on their behalf.
+    ///
+    /// Returning `Err` withholds the result rather than passing it through —
+    /// the caller cannot distinguish "nothing to redact" from "redaction
+    /// failed", so failing open here would be indistinguishable from working.
+    pub redact: Option<fn(&mut String) -> Result<(), String>>,
 }
 
 fn default_should_continue(p: &Progress) -> bool {
@@ -121,6 +142,7 @@ pub fn root_policy() -> Policy {
         check: no_issues,
         tool_defs: None,
         dispatch: None,
+        redact: None,
     }
 }
 
@@ -139,6 +161,7 @@ pub fn sub_policy_of(parent: &Policy) -> Policy {
     Policy {
         tool_defs: parent.tool_defs,
         dispatch: parent.dispatch,
+        redact: parent.redact,
         ..sub_policy()
     }
 }
