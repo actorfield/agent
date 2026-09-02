@@ -64,6 +64,25 @@ pub trait Provider: Send + Sync {
     /// so a paused `ask_user` -- which deliberately breaks the loop before any
     /// tool runs -- leaves history that cannot be sent back as-is.
     fn pending_tool_calls(&self, messages: &Value) -> Vec<(String, String)>;
+
+    /// Content block wrapping an image for a one-shot `llm::single_call`
+    /// (`read_image`). Providers disagree on this the same way they disagree
+    /// about everything else here, and single_call used to hardcode the
+    /// Anthropic shape -- so against an OpenAI-compatible endpoint every image
+    /// read failed at the parser with "cannot unmarshal JSON data as string or
+    /// array of content parts", no matter which model was picked.
+    fn image_block(&self, mime: &str, b64: &str) -> Value;
+
+    /// Content block wrapping a PDF, or `None` where the provider's chat API
+    /// has no document part. `None` is a real answer, not a gap to paper over:
+    /// sending an unsupported block produces a 400 the caller cannot act on,
+    /// whereas "this endpoint cannot read PDFs" is something it can.
+    fn pdf_block(&self, b64: &str) -> Option<Value>;
+
+    /// Assistant text from a one-shot response. `parse_response` is the
+    /// loop's path and carries tool calls, history and usage with it; this is
+    /// the same extraction with none of that attached.
+    fn single_text(&self, resp: &Value) -> Option<String>;
 }
 
 /// Pick a provider from the endpoint URL.
@@ -270,6 +289,21 @@ impl Provider for Anthropic {
             })
             .unwrap_or_default()
     }
+
+    fn image_block(&self, mime: &str, b64: &str) -> Value {
+        json!({"type":"image","source":{"type":"base64","media_type":mime,"data":b64}})
+    }
+
+    fn pdf_block(&self, b64: &str) -> Option<Value> {
+        Some(json!({
+            "type":"document",
+            "source":{"type":"base64","media_type":"application/pdf","data":b64}
+        }))
+    }
+
+    fn single_text(&self, resp: &Value) -> Option<String> {
+        resp["content"][0]["text"].as_str().map(str::to_string)
+    }
 }
 
 // ── OpenAI-compatible ───────────────────────────────────────────────────────────
@@ -434,11 +468,82 @@ impl Provider for OpenAI {
             })
             .unwrap_or_default()
     }
+
+    fn image_block(&self, mime: &str, b64: &str) -> Value {
+        // A data: URI, not a nested source object -- the OpenAI content-part
+        // schema has no `source`, which is what the endpoint rejects outright.
+        json!({"type":"image_url","image_url":{"url":format!("data:{mime};base64,{b64}")}})
+    }
+
+    fn pdf_block(&self, _b64: &str) -> Option<Value> {
+        // Chat-completions content parts are text and images only. Callers
+        // report this rather than sending something that cannot work.
+        None
+    }
+
+    fn single_text(&self, resp: &Value) -> Option<String> {
+        resp["choices"][0]["message"]["content"]
+            .as_str()
+            .map(str::to_string)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const B64: &str = "aGVsbG8=";
+
+    #[test]
+    fn image_block_follows_the_endpoint() {
+        // The bug this exists for: an Anthropic-shaped block sent to an
+        // OpenAI-compatible endpoint is rejected by its parser before any
+        // model sees it, so no choice of model could make read_image work.
+        let oai = OpenAI.image_block("image/png", B64);
+        assert_eq!(oai["type"], "image_url");
+        assert_eq!(
+            oai["image_url"]["url"],
+            format!("data:image/png;base64,{B64}")
+        );
+        assert!(oai["source"].is_null(), "OpenAI parts have no `source`");
+
+        let anth = Anthropic.image_block("image/png", B64);
+        assert_eq!(anth["type"], "image");
+        assert_eq!(anth["source"]["media_type"], "image/png");
+        assert_eq!(anth["source"]["data"], B64);
+    }
+
+    #[test]
+    fn pdf_is_offered_only_where_it_is_accepted() {
+        assert!(Anthropic.pdf_block(B64).is_some());
+        // Not a gap: chat-completions content parts are text and images only,
+        // and saying so beats a 400 the caller cannot act on.
+        assert!(OpenAI.pdf_block(B64).is_none());
+    }
+
+    #[test]
+    fn single_text_reads_each_provider_own_response() {
+        let anth = json!({"content":[{"type":"text","text":"from anthropic"}]});
+        assert_eq!(Anthropic.single_text(&anth).as_deref(), Some("from anthropic"));
+
+        let oai = json!({"choices":[{"message":{"role":"assistant","content":"from openai"}}]});
+        assert_eq!(OpenAI.single_text(&oai).as_deref(), Some("from openai"));
+
+        // Crossed over, each returns None rather than a wrong answer -- which
+        // is what turned a good 200 into "No response" before.
+        assert!(Anthropic.single_text(&oai).is_none());
+        assert!(OpenAI.single_text(&anth).is_none());
+    }
+
+    #[test]
+    fn detect_provider_picks_the_shape_that_endpoint_accepts() {
+        let gateway = "http://aispec-llm-gateway.svc/v1/chat/completions";
+        assert_eq!(detect_provider(gateway).image_block("image/png", B64)["type"], "image_url");
+        assert_eq!(
+            detect_provider("https://api.anthropic.com/v1/messages").image_block("image/png", B64)["type"],
+            "image"
+        );
+    }
 
     fn count_cache_control(v: &Value) -> usize {
         // Recursively count cache_control markers in a request.

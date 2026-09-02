@@ -172,6 +172,7 @@ pub fn single_call(content_block: Value, question: &str) -> String {
         "messages": [{ "role": "user", "content": [content_block, {"type":"text","text":question}] }]
     });
     let url = llm_url();
+    let provider = crate::provider::detect_provider(&url);
     let mut last_err = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
@@ -179,7 +180,14 @@ pub fn single_call(content_block: Value, question: &str) -> String {
         }
         match llm_request(&url).send_json(&req) {
             Ok(resp) => match resp.into_json::<Value>() {
-                Ok(v) => return v["content"][0]["text"].as_str().unwrap_or("No response").to_string(),
+                // Parsed by the same provider that shaped the block. Reading
+                // Anthropic's `content[0].text` off an OpenAI response yielded
+                // "No response" on a perfectly good 200.
+                Ok(v) => {
+                    return provider
+                        .single_text(&v)
+                        .unwrap_or_else(|| "No response".to_string())
+                }
                 Err(e) => return format!("Parse error: {e}"),
             },
             Err(ureq::Error::Status(502, resp)) => {
