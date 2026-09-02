@@ -168,10 +168,8 @@ pub fn read_image(path: &str, question: &str) -> String {
         Ok(v) => v,
         Err(e) => return e,
     };
-    llm::single_call(
-        json!({"type":"image","source":{"type":"base64","media_type":mime,"data":b64}}),
-        question,
-    )
+    let provider = crate::provider::detect_provider(&llm::llm_url());
+    llm::single_call(provider.image_block(&mime, &b64), question)
 }
 
 pub fn read_pdf(path: &str, question: &str) -> String {
@@ -179,10 +177,14 @@ pub fn read_pdf(path: &str, question: &str) -> String {
         Ok(v) => v,
         Err(e) => return e,
     };
-    llm::single_call(
-        json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}}),
-        question,
-    )
+    let provider = crate::provider::detect_provider(&llm::llm_url());
+    match provider.pdf_block(&b64) {
+        Some(block) => llm::single_call(block, question),
+        // Better than the 400 this used to produce: the caller can convert the
+        // pages to images and use read_image, which this endpoint does take.
+        None => "Error: this endpoint's API cannot accept PDFs directly.                  Convert the pages to images (e.g. pdftoppm) and use read_image."
+            .to_string(),
+    }
 }
 
 #[cfg(test)]
