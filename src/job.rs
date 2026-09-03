@@ -149,6 +149,19 @@ pub struct JobResult {
     /// finished. Defaulted so an older serialised result still deserialises.
     #[serde(default)]
     pub ending: Option<crate::policy::Ending>,
+    /// What the provider actually said when a run failed, e.g.
+    /// "HTTP 402: Insufficient Balance".
+    ///
+    /// Ending::Failed covers everything the model provider can refuse for --
+    /// an exhausted balance, a rejected key, a model the endpoint does not
+    /// serve, an unreachable endpoint -- and each is fixed somewhere
+    /// different. llm.rs builds the status and body into a sentence and then
+    /// it was dropped one layer later, so every one of them reached the
+    /// caller as the same bare `Failed` and was reported as the same
+    /// "llm_error". Carried here rather than on Ending so the enum stays Copy
+    /// and every existing match arm keeps compiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
 }
 
 impl JobResult {
@@ -161,6 +174,7 @@ impl JobResult {
             steps_taken,
             issues: Vec::new(),
             ending: None,
+            failure_detail: None,
         }
     }
 
@@ -173,6 +187,7 @@ impl JobResult {
             steps_taken,
             issues: Vec::new(),
             ending: None,
+            failure_detail: None,
         }
     }
 
@@ -185,6 +200,7 @@ impl JobResult {
             steps_taken,
             issues: Vec::new(),
             ending: None,
+            failure_detail: None,
         }
     }
 
@@ -197,6 +213,7 @@ impl JobResult {
             steps_taken,
             issues: Vec::new(),
             ending: None,
+            failure_detail: None,
         }
     }
 
@@ -279,6 +296,7 @@ mod tests {
             steps_taken: 1,
             issues: vec!["nope".into()],
             ending: None,
+            failure_detail: None,
         };
         assert!(!bad.is_consistent());
     }
