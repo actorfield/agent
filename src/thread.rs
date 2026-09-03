@@ -148,18 +148,42 @@ pub fn outcome_for(status: &str, reason: Option<&str>) -> &'static str {
 }
 
 pub fn append_ending(paths: &Paths, status: &str, reason: Option<&str>, iter: usize, max_iter: usize) {
+    append_ending_detailed(paths, status, reason, None, iter, max_iter)
+}
+
+/// As `append_ending`, plus what the provider actually said.
+///
+/// `reason` is a fixed vocabulary -- "llm_error" covers an exhausted balance,
+/// a rejected key, a model the endpoint does not serve and an unreachable
+/// endpoint alike, and each is fixed somewhere different. `detail` carries the
+/// one sentence that tells them apart, so a reader is told what to DO rather
+/// than shown a code. Omitted from the JSON when absent, so a successful
+/// ending is unchanged and older readers see exactly the fields they did.
+pub fn append_ending_detailed(
+    paths: &Paths,
+    status: &str,
+    reason: Option<&str>,
+    detail: Option<&str>,
+    iter: usize,
+    max_iter: usize,
+) {
     use serde_json::json;
-    append_thread(
-        paths,
-        &[json!({
-            "kind": "ending",
-            "outcome": outcome_for(status, reason),
-            "status": status,
-            "reason": reason,
-            "iter": iter,
-            "max_iter": max_iter,
-        })],
-    );
+    let mut marker = json!({
+        "kind": "ending",
+        "outcome": outcome_for(status, reason),
+        "status": status,
+        "reason": reason,
+        "iter": iter,
+        "max_iter": max_iter,
+    });
+    if let Some(d) = detail {
+        // Clipped: this is a human-readable hint, not a log. A provider that
+        // answers an error with a page of HTML must not push the rest of the
+        // thread out of the reader's way.
+        let clipped: String = d.chars().take(300).collect();
+        marker["detail"] = json!(clipped);
+    }
+    append_thread(paths, &[marker]);
 }
 
 pub fn append_thread(paths: &Paths, new_messages: &[Value]) {
@@ -247,6 +271,47 @@ mod tests {
         let loaded = load_thread(&paths);
         assert_eq!(loaded.len(), 2);
         assert!(loaded.iter().all(|m| m.get("kind").is_none()));
+    }
+
+    #[test]
+    fn a_failed_ending_carries_what_the_provider_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        append_ending_detailed(
+            &paths,
+            "failure",
+            Some("llm_error"),
+            Some("HTTP 402: Insufficient Balance"),
+            0,
+            250,
+        );
+        let line = std::fs::read_to_string(paths.thread_path()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["reason"], "llm_error");
+        // The whole point: a reader can tell this from a rejected key.
+        assert_eq!(v["detail"], "HTTP 402: Insufficient Balance");
+    }
+
+    #[test]
+    fn an_ending_without_detail_is_written_exactly_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        append_ending(&paths, "success", None, 3, 250);
+        let line = std::fs::read_to_string(paths.thread_path()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        // Absent, not null: an older reader must see the fields it always saw.
+        assert!(v.get("detail").is_none());
+        assert_eq!(v["outcome"], "done");
+    }
+
+    #[test]
+    fn a_pathological_provider_body_cannot_flood_the_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_root_under(dir.path().to_path_buf());
+        append_ending_detailed(&paths, "failure", Some("llm_error"), Some(&"x".repeat(5000)), 0, 9);
+        let line = std::fs::read_to_string(paths.thread_path()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["detail"].as_str().unwrap().len(), 300);
     }
 
     #[test]

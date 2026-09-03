@@ -226,6 +226,8 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
     let mut last_text = String::new();
     let mut iter = 0usize;
     let ending;
+    // Set only on the failure paths below; None on every other ending.
+    let mut failure_detail: Option<String> = None;
 
     loop {
         // Check for external cancellation signal (written by cancel-agent handler).
@@ -270,6 +272,10 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
                 ending = if crate::llm::is_context_limit_error(&e.to_string()) {
                     Ending::ContextExhausted
                 } else {
+                    // Keep what the provider said. "HTTP 402: Insufficient
+                    // Balance" and "HTTP 401" need different things done about
+                    // them, and this is the last place that knows which.
+                    failure_detail = Some(e.to_string());
                     Ending::Failed
                 };
                 break;
@@ -279,6 +285,7 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[agent {label}] parse error: {e}");
+                failure_detail = Some(format!("response parse error: {e}"));
                 ending = Ending::Failed;
                 break;
             }
@@ -437,6 +444,7 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         steps_taken,
         issues,
         ending: Some(ending),
+        failure_detail,
     }
 }
 
