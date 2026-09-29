@@ -36,22 +36,12 @@ pub enum Ending {
     Blocked,
     /// Cancelled by external signal (cancel file).
     Cancelled,
-    /// The conversation outgrew the model's context window.
-    ///
-    /// Distinct from Failed: nothing is broken and nothing will be fixed by
-    /// retrying the same thread -- the run needs a fresh thread or a compacted
-    /// history. Reported as a generic failure it reads as a bug, and the one
-    /// action that actually helps is not suggested.
+    /// The conversation outgrew the model's context window. Not Failed:
+    /// retrying the same thread won't help; it needs a fresh or compacted one.
     ContextExhausted,
     /// The model asked the user a question and is waiting for the answer.
-    ///
-    /// A terminus, not a failure: the run stopped because it needs a human,
-    /// which is the correct behaviour when a task is genuinely ambiguous. Kept
-    /// distinct from Blocked (a tool or precondition is missing, which the user
-    /// cannot resolve by replying) and from Stopped (the model believes it is
-    /// finished) so a caller can tell "answer me" from "I'm done" -- they look
-    /// identical in the transcript otherwise, and the run that is waiting is
-    /// the one that must not be reported as complete.
+    /// Unlike Blocked, a reply resolves it; unlike Stopped, the run must not be
+    /// reported as complete.
     AwaitingInput,
 }
 
@@ -77,26 +67,12 @@ pub struct Policy {
     /// tool output; `None` falls through to the builtin implementations.
     /// `spawn_agent` is never routed here — delegation is loop infrastructure.
     pub dispatch: Option<fn(&ToolCall) -> Option<String>>,
-    /// Optional redaction applied to every tool result BEFORE it enters the
-    /// conversation, and therefore before it is sent, persisted to
-    /// `thread.jsonl`, or synced anywhere.
+    /// Optional redaction applied to every tool result before it enters the
+    /// conversation (so before it is sent, persisted to `thread.jsonl`, or
+    /// synced). It takes the raw output text, not the provider-shaped wrapped
+    /// message, and covers every tool, including ones added later.
     ///
-    /// Takes the raw output string, deliberately -- NOT the wrapped message.
-    /// By the time a result has been through `wrap_tool_results` it carries
-    /// provider-specific structure (Anthropic nests the text under a
-    /// `tool_result` block, OpenAI does not), so a redactor operating there
-    /// would need to know both shapes, and one recursing the whole value would
-    /// rewrite `tool_use_id` and break the conversation. Here it is just text.
-    ///
-    /// This is a door, not a convention: tool results are the only route by
-    /// which content the model has never seen reaches the message array, so a
-    /// hook here cannot be forgotten by a tool added later. A dispatcher arm
-    /// that redacts is a promise each new arm has to remember to keep; this is
-    /// the loop keeping it on their behalf.
-    ///
-    /// Returning `Err` withholds the result rather than passing it through —
-    /// the caller cannot distinguish "nothing to redact" from "redaction
-    /// failed", so failing open here would be indistinguishable from working.
+    /// `Err` withholds the result: failing open would look like success.
     pub redact: Option<fn(&mut String) -> Result<(), String>>,
 }
 
@@ -116,13 +92,9 @@ fn default_classify(end: Ending, _p: &Progress) -> (Status, Option<FailureKind>)
         Ending::Failed => (Status::Failure, Some(FailureKind::RetrievalFailed)),
         Ending::Blocked => (Status::Blocked, Some(FailureKind::ToolUnavailable)),
         Ending::Cancelled => (Status::Partial, Some(FailureKind::BudgetExceeded)),
-        // Blocked, not Partial: the work is not incomplete through any fault of
-        // the run, it is suspended pending an answer. AmbiguousRequest is the
-        // existing kind that means exactly "needs the user to disambiguate".
+        // Suspended pending an answer, not incomplete.
         Ending::AwaitingInput => (Status::Blocked, Some(FailureKind::AmbiguousRequest)),
-        // Partial, like the other ceilings: the work done so far stands, and
-        // the run stopped because it hit a limit rather than because anything
-        // went wrong.
+        // A ceiling like the others: the work so far stands.
         Ending::ContextExhausted => (Status::Partial, Some(FailureKind::BudgetExceeded)),
     }
 }
