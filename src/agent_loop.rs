@@ -295,7 +295,7 @@ pub fn run(ctx: &Ctx, cfg: RunConfig) -> JobResult {
         }
         if thread_id.is_some() {
             if let Some(u) = &parsed.usage {
-                thread::append_usage(&ctx.paths, u.input_tokens, u.output_tokens);
+                thread::append_usage(&ctx.paths, u.input_tokens, u.output_tokens, u.cached_tokens);
             }
         }
         messages.as_array_mut().unwrap().push(parsed.assistant_msg);

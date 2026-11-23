@@ -99,7 +99,7 @@ pub fn load_thread(paths: &Paths) -> Vec<Value> {
 /// "role" instead); load_thread filters these out before reconstructing
 /// history. The frontend reads them directly from the same file to show a
 /// context-usage indicator.
-pub fn append_usage(paths: &Paths, input_tokens: u64, output_tokens: u64) {
+pub fn append_usage(paths: &Paths, input_tokens: u64, output_tokens: u64, cached_tokens: u64) {
     use serde_json::json;
     append_thread(
         paths,
@@ -107,6 +107,7 @@ pub fn append_usage(paths: &Paths, input_tokens: u64, output_tokens: u64) {
             "kind": "usage",
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
         })],
     );
 }
@@ -243,7 +244,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::for_root_under(dir.path().to_path_buf());
         append_thread(&paths, &[json!({"role":"user","content":"a"})]);
-        append_usage(&paths, 10, 20);
+        append_usage(&paths, 10, 20, 0);
         append_ending(&paths, "partial", Some("iter_exhausted"), 50, 50);
         let loaded = load_thread(&paths);
         assert_eq!(loaded.len(), 1, "only the real turn survives");
@@ -266,7 +267,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::for_root_under(dir.path().to_path_buf());
         append_thread(&paths, &[json!({"role": "user", "content": "hi"})]);
-        append_usage(&paths, 100, 20);
+        append_usage(&paths, 100, 20, 0);
         append_thread(&paths, &[json!({"role": "assistant", "content": "hey"})]);
         let loaded = load_thread(&paths);
         assert_eq!(loaded.len(), 2);
@@ -358,12 +359,13 @@ mod tests {
     fn append_usage_writes_a_kind_usage_line() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::for_root_under(dir.path().to_path_buf());
-        append_usage(&paths, 42, 7);
+        append_usage(&paths, 42, 7, 30);
         let contents = std::fs::read_to_string(paths.thread_path()).unwrap();
         let line: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
         assert_eq!(line["kind"], "usage");
         assert_eq!(line["input_tokens"], 42);
         assert_eq!(line["output_tokens"], 7);
+        assert_eq!(line["cached_tokens"], 30);
     }
 
     #[test]
