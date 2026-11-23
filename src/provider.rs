@@ -25,8 +25,12 @@ pub struct ParsedResponse {
 }
 
 pub struct Usage {
+    /// The whole prompt, cached part included, for every provider.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// The part of `input_tokens` the provider served from its prompt cache:
+    /// billed lower and read faster, so the total alone overstates a turn.
+    pub cached_tokens: u64,
 }
 
 pub struct ToolCall {
@@ -206,9 +210,14 @@ impl Provider for Anthropic {
             }
         }
 
-        let usage = (!resp["usage"].is_null()).then(|| Usage {
-            input_tokens: resp["usage"]["input_tokens"].as_u64().unwrap_or(0),
-            output_tokens: resp["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        // Anthropic counts cache reads and writes apart from input_tokens.
+        let usage = (!resp["usage"].is_null()).then(|| {
+            let n = |k: &str| resp["usage"][k].as_u64().unwrap_or(0);
+            Usage {
+                input_tokens: n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens"),
+                output_tokens: n("output_tokens"),
+                cached_tokens: n("cache_read_input_tokens"),
+            }
         });
 
         Ok(ParsedResponse {
@@ -388,9 +397,18 @@ impl Provider for OpenAI {
             assistant_msg["reasoning_content"] = msg["reasoning_content"].clone();
         }
 
-        let usage = (!resp["usage"].is_null()).then(|| Usage {
-            input_tokens: resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-            output_tokens: resp["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+        // prompt_tokens includes the cached part: OpenAI names it in
+        // prompt_tokens_details, DeepSeek in prompt_cache_hit_tokens.
+        let usage = (!resp["usage"].is_null()).then(|| {
+            let u = &resp["usage"];
+            Usage {
+                input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+                output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+                cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .or_else(|| u["prompt_cache_hit_tokens"].as_u64())
+                    .unwrap_or(0),
+            }
         });
 
         Ok(ParsedResponse {
@@ -691,6 +709,19 @@ mod tests {
         let usage = parsed.usage.expect("usage should be present");
         assert_eq!(usage.input_tokens, 123);
         assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.cached_tokens, 0);
+    }
+
+    #[test]
+    fn anthropic_input_counts_the_cache_too() {
+        // Anthropic reports cache reads and writes apart from input_tokens;
+        // the total prompt is all three.
+        let resp = json!({
+            "content": [{"type":"text","text":"hi"}],
+            "usage": {"input_tokens": 50, "output_tokens": 9, "cache_read_input_tokens": 9000, "cache_creation_input_tokens": 400}
+        });
+        let u = Anthropic.parse_response(resp).unwrap().usage.unwrap();
+        assert_eq!((u.input_tokens, u.cached_tokens), (9450, 9000));
     }
 
     #[test]
@@ -721,6 +752,23 @@ mod tests {
         let usage = parsed.usage.expect("usage should be present");
         assert_eq!(usage.input_tokens, 200);
         assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cached_tokens, 0);
+    }
+
+    #[test]
+    fn openai_usage_carries_the_cached_part() {
+        // DeepSeek through an OpenAI-compatible gateway reports both shapes.
+        let resp = json!({
+            "choices":[{"message":{"content":"hi"}}],
+            "usage": {"prompt_tokens": 15939, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 15872},
+                      "prompt_cache_hit_tokens": 15872, "prompt_cache_miss_tokens": 67}
+        });
+        let u = OpenAI.parse_response(resp).unwrap().usage.unwrap();
+        assert_eq!((u.input_tokens, u.cached_tokens), (15939, 15872));
+        // DeepSeek's own field alone.
+        let resp = json!({"choices":[{"message":{"content":"hi"}}],
+                          "usage": {"prompt_tokens": 100, "completion_tokens": 1, "prompt_cache_hit_tokens": 64}});
+        assert_eq!(OpenAI.parse_response(resp).unwrap().usage.unwrap().cached_tokens, 64);
     }
 
     #[test]
