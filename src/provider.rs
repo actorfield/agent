@@ -69,6 +69,12 @@ pub trait Provider: Send + Sync {
     /// tool runs -- leaves history that cannot be sent back as-is.
     fn pending_tool_calls(&self, messages: &Value) -> Vec<(String, String)>;
 
+    /// Whether its replies are read as a stream (`llm::assemble_openai_stream`
+    /// rebuilds them for `parse_response`). Off by default.
+    fn streams(&self) -> bool {
+        false
+    }
+
     /// Content block wrapping an image for a one-shot `llm::single_call`
     /// (`read_image`). Providers disagree on this the same way they disagree
     /// about everything else here, and single_call used to hardcode the
@@ -320,6 +326,10 @@ impl Provider for Anthropic {
 pub struct OpenAI;
 
 impl Provider for OpenAI {
+    fn streams(&self) -> bool {
+        true
+    }
+
     fn shape_tools(&self, base: &Value) -> Value {
         let arr = match base.as_array() {
             Some(a) => a,
